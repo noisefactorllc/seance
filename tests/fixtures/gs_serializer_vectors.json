@@ -1,0 +1,39 @@
+{
+ "key": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+ "fixed_ts": 1751500000,
+ "vectors": [
+  {
+   "name": "member_cookie",
+   "payload": "0f9b2d7e-1111-2222-3333-444455556666;203.0.113.7",
+   "expires_in": null,
+   "minted_at": 1751500000,
+   "token": "gAAAAABoZcTgf3A4ilq9oNCkCPxGji0UW5AsqnJAFOp4OdLGhc2O-i9avn8OX_eTfQOgzDZNrZFGmcqUH8iz-jFvuxg6suEILsIg8bAVVO-xjYMItLvtqlVi75tUZSyIGTjSgaaibTKBzb4BPh5K8PznUsFSMWT78g=="
+  },
+  {
+   "name": "ephemeral_cookie",
+   "payload": "abcd1234-aaaa-bbbb-cccc-ddddeeeeffff;203.0.113.7;ephemeral;0f9b2d7e-1111-2222-3333-444455556666",
+   "expires_in": 5400,
+   "minted_at": 1751500000,
+   "token": "gAAAAABoZcTg5cz6ha5y_VYIT189WMvRtez1B7yVLHibjdayIGkJ3HO2WzuV_rZ8ZL8vgs4JtNEid9NdLd61El1eB19NsmpmD51KR3gN6MUE57Hln8ubOuvPJAzSJT31MCSO3Z1mf7E8hjqm06Y9svTa6wNISpSTSW1lYU8a_F0BPfnEyNP5cY2VTNfvkYt05Z7CWsp-B1ZQDNrjY9EYHBhhG3lcv-SS7w=="
+  },
+  {
+   "name": "plain",
+   "payload": "hello world",
+   "expires_in": null,
+   "minted_at": 1751500000,
+   "token": "gAAAAABoZcTg8ypTjsMnJ86uaGbGWVKrQbSppl0IJRZQMwIqilFK182hL4mFzJaw4QhQ6p9mr3pHiZua7wgwmIAf8Ygrh8q68SU75MGfwxcbNYyxx-GytPY="
+  },
+  {
+   "name": "with_ttl",
+   "payload": "data-with-ttl",
+   "expires_in": 600,
+   "minted_at": 1751500000,
+   "token": "gAAAAABoZcTg3wHH8xr8CLOIzA-beUXhuGKLYs2LdrD0W3Z0J8YV9Us5ig-MNSIPB6eHYDUuE6t3Kjqvge5TxqpoAlx6vHMZ3S13v58sJDlfTQ4PqQiGpBo="
+  }
+ ],
+ "semantics": {
+  "embedded_ttl_expires": true,
+  "max_age_within": true,
+  "max_age_expired_raises": true
+ }
+}

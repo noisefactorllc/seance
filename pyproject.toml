@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seance"
+version = "0.2.1"
+description = "Real-time collaboration server for creative DSL clients"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "Noise Factor LLC", email = "team@noisefactor.io" }]
+dependencies = [
+    "aiohttp==3.14.3",
+    "aiosqlite==0.22.1",
+    "asyncpg==0.31.0",
+    "cryptography==50.0.0",
+]
+
+[project.scripts]
+seance = "app.main:run"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: load/perf tests, run explicitly with -m slow"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S311"]

@@ -1,0 +1,40 @@
+{
+  "name": "@noisefactor/seance",
+  "version": "0.2.1",
+  "description": "Real-time collaboration server and browser SDK for creative DSL clients",
+  "type": "module",
+  "author": "Noise Factor LLC <team@noisefactor.io>",
+  "license": "MIT",
+  "homepage": "https://github.com/noisefactorllc/seance#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/noisefactorllc/seance.git"
+  },
+  "bugs": {
+    "url": "https://github.com/noisefactorllc/seance/issues"
+  },
+  "keywords": [
+    "collaboration",
+    "websocket",
+    "creative-coding",
+    "dsl",
+    "handfish"
+  ],
+  "main": "./sdk/index.js",
+  "exports": {
+    ".": "./sdk/index.js",
+    "./sdk": "./sdk/index.js"
+  },
+  "files": [
+    "sdk/",
+    "dist/",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:sdk": "node scripts/build-sdk.mjs",
+    "prepack": "npm run build:sdk",
+    "test:sdk": "npm run build:sdk && node --test tests/sdk/*.test.mjs"
+  }
+}
