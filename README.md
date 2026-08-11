@@ -44,8 +44,10 @@ Configuration is environment-only; every variable is documented in
 
 ## SDK
 
+The SDK is not published to npm. Use the checked-out source directly:
+
 ```js
-import { createOnlineDslLayer } from '@noisefactor/seance/sdk'
+import { createOnlineDslLayer } from './sdk/index.js'
 ```
 
 Build the standalone browser bundle:

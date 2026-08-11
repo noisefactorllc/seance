@@ -2,14 +2,10 @@
 
 Zero-dependency browser ESM layer for taking a Handfish-backed DSL editor online.
 
-Install the `0.2.1` release from npm, or import the checked-out source directly:
-
-```sh
-npm install @noisefactor/seance@0.2.1
-```
+The SDK is not published to npm. Use the checked-out source directly:
 
 ```js
-import { createOnlineDslLayer } from '@noisefactor/seance/sdk'
+import { createOnlineDslLayer } from './sdk/index.js'
 
 const online = createOnlineDslLayer({
   seanceUrl: 'https://seance.noisefactor.io',
