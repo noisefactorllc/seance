@@ -1,3 +1,8 @@
+<!-- repo-hero -->
+<a href="https://noisefactor.io/"><img src="docs/hero.jpg" alt="Seance Real-time collaboration server and browser SDK" width="100%"></a>
+
+<sub>Open source from <a href="https://noisefactor.io">Noise Factor</a> &middot; <a href="https://github.com/noisefactorllc">more projects</a></sub>
+
 # Seance
 
 Seance is a session-scoped real-time collaboration backend for browser-based
