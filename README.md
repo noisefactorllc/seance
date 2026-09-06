@@ -18,8 +18,7 @@ lock, toggle guest access, and mark users read-only. Moderation state persists
 across freeze/thaw.
 
 Seance also includes a zero-dependency browser ESM SDK for Handfish-backed DSL
-editors. The SDK is optional; the wire protocol is documented for direct
-clients.
+editors. The SDK is optional. Direct clients can use the documented wire protocol.
 
 ## Documentation
 
@@ -44,8 +43,8 @@ SEANCE_ALLOWED_ORIGINS=http://localhost:3000 \
 Then `curl -s http://127.0.0.1:8000/up` should return
 `{"status": "ok", "service": "seance", "version": "0.2.1"}`.
 
-Configuration is environment-only; every variable is documented in
-`docs/operations.md`.
+Configuration uses only environment variables. `docs/operations.md`
+documents every variable.
 
 ## SDK
 
@@ -61,7 +60,7 @@ Build the standalone browser bundle:
 npm run build:sdk
 ```
 
-The generated bundle is written to `dist/index.js`.
+The build writes the generated bundle to `dist/index.js`.
 
 ## Tests
 
