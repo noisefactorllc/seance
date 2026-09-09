@@ -86,6 +86,7 @@ class Limits:
     checkpoint_ops: int = 500
     checkpoint_secs: float = 30.0
     frozen_session_ttl: float = 86_400.0
+    unclaimed_session_ttl: float = 3_600.0
     max_sessions: int = 1000
     max_connections: int = 4096
     send_queue_frames: int = 256

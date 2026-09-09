@@ -658,6 +658,59 @@ async def test_retention_delete_does_not_orphan_racing_thaw(hub_factory, clock, 
         assert await store.load_session(sid) is not None
 
 
+async def test_unclaimed_session_is_swept_on_the_short_ttl(hub_factory, clock):
+    """A created session nobody joined holds a row against the global cap.
+
+    Rows are what MAX_SESSIONS counts, so cheap creates could otherwise fill it
+    for a whole retention window and answer 503 to everyone.
+    """
+    hub, store = await hub_factory(frozen_session_ttl=86_400.0, unclaimed_session_ttl=100.0)
+    sid = await hub.create_session(member("owner"))
+    assert (await store.load_session(sid))["first_joined_at"] is None
+
+    clock.advance(50.0)
+    await hub.scan()
+    assert await store.load_session(sid) is not None  # inside the short TTL
+
+    clock.advance(60.0)
+    await hub.scan()
+    assert await store.load_session(sid) is None
+    assert await store.count_sessions() == 0
+
+
+async def test_a_joined_session_keeps_the_long_retention(hub_factory, clock):
+    """The marker is durable: a session that was used is not disposable."""
+    hub, store = await hub_factory(frozen_session_ttl=86_400.0, unclaimed_session_ttl=100.0)
+    sid = await hub.create_session(member("owner"))
+    owner = FakeConn(member("owner"))
+    session = await hub.connect(sid, owner)
+    joined_at = session.first_joined_at
+    assert joined_at is not None
+
+    hub.disconnect(session, owner.connection_id)
+    clock.advance(hub.limits.freeze_grace + 1)
+    await hub.scan()  # freezes it
+    assert (await store.load_session(sid))["first_joined_at"] == joined_at
+
+    clock.advance(1_000.0)  # far past the unclaimed TTL, far short of the long one
+    await hub.scan()
+    assert await store.load_session(sid) is not None
+
+    # And the marker survives a thaw, so it is not re-armed by rejoining later.
+    rejoined = await hub.connect(sid, FakeConn(member("owner")))
+    assert rejoined.first_joined_at == joined_at
+
+
+async def test_unclaimed_sweep_disabled_when_ttl_not_positive(hub_factory, clock):
+    hub, store = await hub_factory(frozen_session_ttl=1_000_000.0, unclaimed_session_ttl=0.0)
+    sid = await hub.create_session(member("owner"))
+
+    clock.advance(100_000.0)
+    await hub.scan()
+
+    assert await store.load_session(sid) is not None
+
+
 async def test_failed_ban_sink_logged_not_lost(hub_factory, clock, caplog, monkeypatch):
     hub, store = await hub_factory()
     owner = FakeConn(member("owner"))

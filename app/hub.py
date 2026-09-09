@@ -87,6 +87,7 @@ class Hub:
         self._loop_task: asyncio.Task | None = None
         self._interval = max(0.5, min(self.limits.freeze_grace, self.limits.checkpoint_secs) / 2)
         self._frozen_session_ttl = float(self.limits.frozen_session_ttl)
+        self._unclaimed_session_ttl = float(self.limits.unclaimed_session_ttl)
 
     # --------------------------------------------------------------------- #
     # Properties
@@ -433,6 +434,9 @@ class Hub:
     async def scan(self) -> None:
         """One freeze-grace + checkpoint pass over the live sessions.
 
+        Also prunes frozen rows past ``frozen_session_ttl`` and never-joined rows
+        past the shorter ``unclaimed_session_ttl``.
+
         Settles pending write-throughs first so a ban lands before its session is
         frozen. Freezes every empty session past ``freeze_grace``, then
         checkpoints any live session that has *changed* since its last save and
@@ -465,6 +469,15 @@ class Hub:
         if self._frozen_session_ttl > 0:
             cutoff = int(now - self._frozen_session_ttl)
             for session_id in await self.store.list_frozen_older_than(cutoff):
+                await self._delete_frozen_if_still_cold(session_id)
+
+        if self._unclaimed_session_ttl > 0:
+            # A created session that nobody ever joined holds a row, and rows are
+            # what MAX_SESSIONS counts, so leaving them for the full retention
+            # window lets cheap creates fill the global cap and answer 503 to
+            # everyone. Nothing of value is lost: no client ever saw it.
+            cutoff = int(now - self._unclaimed_session_ttl)
+            for session_id in await self.store.list_unclaimed_older_than(cutoff):
                 await self._delete_frozen_if_still_cold(session_id)
 
     async def _delete_frozen_if_still_cold(self, session_id: str) -> None:

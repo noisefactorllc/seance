@@ -64,6 +64,7 @@ _EXPECTED_LIMITS = {
     "checkpoint_ops": (500, int),
     "checkpoint_secs": (30.0, float),
     "frozen_session_ttl": (86400.0, float),
+    "unclaimed_session_ttl": (3600.0, float),
     "max_sessions": (1000, int),
     "max_connections": (4096, int),
     "send_queue_frames": (256, int),

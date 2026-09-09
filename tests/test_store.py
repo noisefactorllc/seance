@@ -61,6 +61,7 @@ def _sample_payload() -> dict:
         "seq": 42,
         "frozen_at": 1_751_500_100,
         "last_active": 1_751_500_090,
+        "first_joined_at": 1_751_500_010,
     }
 
 
@@ -89,7 +90,7 @@ async def test_schema_version_row_present(tmp_path):
         ) as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row[0] == "3"
+        assert row[0] == "4"
     finally:
         await store.close()
 
@@ -272,6 +273,42 @@ async def test_delete_session(tmp_path):
         await store.close()
 
 
+async def test_list_unclaimed_older_than_selects_only_never_joined_rows(tmp_path):
+    store = await Store.open(str(tmp_path / "test.db"))
+    try:
+        never_joined = _sample_payload()
+        never_joined["frozen_at"] = 100
+        never_joined["first_joined_at"] = None
+        joined = _sample_payload()
+        joined["frozen_at"] = 100
+        joined["first_joined_at"] = 50
+        live = _sample_payload()
+        live["frozen_at"] = None
+        live["first_joined_at"] = None
+        await store.save_session("sess-unclaimed", never_joined)
+        await store.save_session("sess-joined", joined)
+        await store.save_session("sess-live", live)
+
+        assert await store.list_unclaimed_older_than(200) == ["sess-unclaimed"]
+        assert await store.list_unclaimed_older_than(100) == []  # strictly older
+        # The long sweep still sees both frozen rows.
+        assert await store.list_frozen_older_than(200) == ["sess-joined", "sess-unclaimed"]
+    finally:
+        await store.close()
+
+
+async def test_first_joined_at_defaults_to_null_for_a_legacy_payload(tmp_path):
+    """A payload written before the marker existed loads as never joined, not as an error."""
+    store = await Store.open(str(tmp_path / "test.db"))
+    try:
+        payload = _sample_payload()
+        del payload["first_joined_at"]
+        await store.save_session("sess-legacy", payload)
+        assert (await store.load_session("sess-legacy"))["first_joined_at"] is None
+    finally:
+        await store.close()
+
+
 async def test_retention_sweep_query_uses_the_frozen_at_index(tmp_path):
     """The sweep runs every 15 s; without the index it scans every row's overflow pages."""
     store = await Store.open(str(tmp_path / "test.db"))
@@ -435,7 +472,7 @@ async def test_open_rejects_unsupported_schema_version(tmp_path):
     await store.close()
     conn = sqlite3.connect(str(db_path))
     try:
-        conn.execute("UPDATE meta SET v = '4' WHERE k = 'schema_version'")
+        conn.execute("UPDATE meta SET v = '9' WHERE k = 'schema_version'")
         conn.commit()
     finally:
         conn.close()

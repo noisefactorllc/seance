@@ -87,6 +87,7 @@ dedicated alias; when both are set, `SEANCE_LIMIT_*` **wins**. Aliases:
 | `CHECKPOINT_OPS` | 500 | seq delta (counts all emitted events, including server frames) that triggers a live checkpoint. |
 | `CHECKPOINT_SECS` | 30.0 | Seconds **since the last save** that triggers a live checkpoint. A session with no change since that save is skipped, so an idle session is not rewritten. |
 | `FROZEN_SESSION_TTL` | 86400.0 | Seconds a frozen session is retained before the in-process sweep may delete it; `<= 0` disables the sweep. |
+| `UNCLAIMED_SESSION_TTL` | 3600.0 | Seconds a **never-joined** session is retained. A session that was created but never connected to is deleted on this shorter clock, so abandoned creates cannot hold rows against `MAX_SESSIONS`; `<= 0` disables this sweep and leaves them to `FROZEN_SESSION_TTL`. |
 | `MAX_SESSIONS` | 1000 | Global **persisted-row** cap, live and frozen alike (`503` on create when reached). Because frozen rows count until `FROZEN_SESSION_TTL` expires them, this bounds total creates per TTL window, not concurrent sessions; size the two together (section 8). |
 | `MAX_CONNECTIONS` | 4096 | Global connection cap (`4429` on join when reached). |
 | `SEND_QUEUE_FRAMES` | 256 | Per-connection send-queue frame budget (overflow → shed cursors, then `4408`). |
@@ -184,6 +185,16 @@ Frozen sessions are pruned by the hub's in-process `scan()` loop when
 Set `SEANCE_LIMIT_FROZEN_SESSION_TTL=0` or any negative value to disable the
 sweep and retain frozen sessions indefinitely.
 
+A session that was **created and never joined** is pruned on the shorter
+`UNCLAIMED_SESSION_TTL` (default one hour) by the same lock-protected path.
+`POST /v1/sessions` persists a row immediately, and `MAX_SESSIONS` counts rows,
+so without this a run of cheap creates could hold the global cap for a whole
+retention window and answer `503` to everyone else. Nothing a client has seen is
+affected: the row is deleted only while `first_joined_at IS NULL`, a marker set
+on the first connection ever admitted and carried through freeze and thaw. Rows
+written before this marker existed load as `NULL`, so a pre-upgrade database
+keeps the long retention for sessions it cannot classify.
+
 The sweep computes `cutoff = now - frozen_session_ttl`, lists rows with
 `frozen_at IS NOT NULL AND frozen_at < cutoff`, then serializes each candidate
 against thaw/freeze using the same per-session lock as `connect()`. Under that
@@ -197,6 +208,8 @@ The store exposes the two primitives used by that sweep:
   `Store.open()` creates if absent, so an existing database picks it up on the
   next start. Without it the sweep scans every row's overflow pages (measured at
   64 ms per pass over 64 rows of 8 MB, against 0.1 ms indexed).
+- `Store.list_unclaimed_older_than(ts)` → ids of rows with `frozen_at IS NOT
+  NULL AND first_joined_at IS NULL AND frozen_at < ts`, sorted.
 - `Store.delete_session(id)` → delete one session row and its session-scoped
   bans. Audit rows are intentionally retained.
 
@@ -343,7 +356,9 @@ generous relative to a small container:
   `FROZEN_SESSION_TTL` deletes them, so with the 24 h default the cap is really
   "creates per day": once 1,000 rows exist, every create answers `503` until the
   sweep catches up. Lower `MAX_SESSIONS`, shorten the TTL, or provision for the
-  full product.
+  full product. Abandoned creates expire on `UNCLAIMED_SESSION_TTL` (default
+  one hour) rather than the full window, so the steady-state row count is driven
+  by sessions people actually joined.
 - **RAM**: a live session costs roughly its own JSON size plus about 0.1 MB per
   connection, and a thaw peaks transiently at a few times the payload. A 1 GiB
   container therefore holds on the order of 100 max-size sessions, far fewer

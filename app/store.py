@@ -22,7 +22,7 @@ import aiosqlite
 
 from app.audit import AuditEvent, log_audit
 
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "4"
 
 
 def _harden_wal_sidecars(path: str) -> None:
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   settings TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL,
   poly TEXT NOT NULL, docs TEXT NOT NULL, chat TEXT NOT NULL, rev INTEGER NOT NULL,
   seq INTEGER NOT NULL, frozen_at INTEGER, last_active INTEGER NOT NULL,
-  dialect TEXT NOT NULL DEFAULT 'noisemaker-dsl');
+  dialect TEXT NOT NULL DEFAULT 'noisemaker-dsl', first_joined_at INTEGER);
 CREATE TABLE IF NOT EXISTS bans (
   session_id TEXT NOT NULL, user_id TEXT NOT NULL, banned_by TEXT NOT NULL,
   at INTEGER NOT NULL, PRIMARY KEY (session_id, user_id));
@@ -145,12 +145,20 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             elif row[0] == "1":
                 await _migrate_v1_to_v2(db)
                 await _migrate_v2_to_v3(db)
+                await _migrate_v3_to_v4(db)
                 await db.execute(
                     "UPDATE meta SET v = ? WHERE k = ?", (_SCHEMA_VERSION, "schema_version")
                 )
                 await db.commit()
             elif row[0] == "2":
                 await _migrate_v2_to_v3(db)
+                await _migrate_v3_to_v4(db)
+                await db.execute(
+                    "UPDATE meta SET v = ? WHERE k = ?", (_SCHEMA_VERSION, "schema_version")
+                )
+                await db.commit()
+            elif row[0] == "3":
+                await _migrate_v3_to_v4(db)
                 await db.execute(
                     "UPDATE meta SET v = ? WHERE k = ?", (_SCHEMA_VERSION, "schema_version")
                 )
@@ -188,12 +196,13 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             payload["frozen_at"],
             payload["last_active"],
             payload["dialect"],
+            payload.get("first_joined_at"),
         )
         await self._db.execute(
             "INSERT OR REPLACE INTO sessions "
             "(id, created_by, created_at, settings, state, data, poly, docs, chat, "
-            "rev, seq, frozen_at, last_active, dialect) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "rev, seq, frozen_at, last_active, dialect, first_joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             values,
         )
         await self._db.commit()
@@ -203,7 +212,8 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
         """Return the session payload for ``session_id`` (JSON columns decoded) or None."""
         async with self._db.execute(
             "SELECT created_by, created_at, settings, state, data, poly, docs, chat, "
-            "rev, seq, frozen_at, last_active, dialect FROM sessions WHERE id = ?",
+            "rev, seq, frozen_at, last_active, dialect, first_joined_at "
+            "FROM sessions WHERE id = ?",
             (session_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -223,6 +233,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             "frozen_at": row[10],
             "last_active": row[11],
             "dialect": row[12],
+            "first_joined_at": row[13],
         }
 
     async def count_sessions(self) -> int:
@@ -251,6 +262,20 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
         async with self._db.execute(
             "SELECT id FROM sessions WHERE frozen_at IS NOT NULL AND frozen_at < ? "
             "ORDER BY id",
+            (ts,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def list_unclaimed_older_than(self, ts: int) -> list[str]:
+        """Return sorted ids of frozen sessions nobody ever joined, frozen before ``ts``.
+
+        A row keeps ``first_joined_at IS NULL`` from creation until its first
+        connect, so this is exactly the set that was created and then abandoned.
+        """
+        async with self._db.execute(
+            "SELECT id FROM sessions WHERE frozen_at IS NOT NULL AND first_joined_at IS NULL "
+            "AND frozen_at < ? ORDER BY id",
             (ts,),
         ) as cursor:
             rows = await cursor.fetchall()
@@ -330,6 +355,15 @@ async def _migrate_v1_to_v2(db: aiosqlite.Connection) -> None:
         columns = {row[1] for row in await cursor.fetchall()}
     if "docs" not in columns:
         await db.execute("ALTER TABLE sessions ADD COLUMN docs TEXT NOT NULL DEFAULT '[]'")
+
+
+async def _migrate_v3_to_v4(db: aiosqlite.Connection) -> None:
+    async with db.execute("PRAGMA table_info(sessions)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    if "first_joined_at" not in columns:
+        # NULL for every existing row: a session already in the store predates
+        # the marker, so it is treated as claimed and keeps the long retention.
+        await db.execute("ALTER TABLE sessions ADD COLUMN first_joined_at INTEGER")
 
 
 async def _migrate_v2_to_v3(db: aiosqlite.Connection) -> None:

@@ -111,6 +111,10 @@ class Session:
         self.conns: dict[str, ConnLike] = {}
         self.readonly_users: set[str] = set()
 
+        # Timestamp of the first connection ever admitted, or None while the
+        # session has only ever been created. Retention treats a session nobody
+        # joined as disposable, so this has to survive freeze and thaw.
+        self.first_joined_at: int | None = None
         self._join_order: dict[str, int] = {}
         self._join_counter = 0
         self.seq = 0
@@ -519,6 +523,8 @@ class Session:
                 raise JoinRefused(protocol.CLOSE_LIMIT, "too many connections")
 
         self.conns[conn.connection_id] = conn
+        if self.first_joined_at is None:
+            self.first_joined_at = int(self.clock())
         if identity.user_id not in self._join_order:
             self._join_order[identity.user_id] = self._join_counter
             self._join_counter += 1
@@ -1162,6 +1168,7 @@ class Session:
             "seq": self.seq,
             "frozen_at": None,
             "last_active": int(self.clock()),
+            "first_joined_at": self.first_joined_at,
         }
 
     @classmethod
@@ -1202,6 +1209,7 @@ class Session:
             dialect=payload.get("dialect", protocol.DEFAULT_DIALECT),
         )
         session.created_at = payload["created_at"]
+        session.first_joined_at = payload.get("first_joined_at")
         session.readonly_users = set(raw_settings.get("readonly_users", []))
         session.state.load(payload["state"])
         session.data.load(payload["data"])

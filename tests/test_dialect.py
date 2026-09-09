@@ -403,7 +403,7 @@ async def test_v2_database_migrates_to_v3_legacy_row_defaults_dialect(tmp_path):
             "SELECT v FROM meta WHERE k = 'schema_version'"
         ) as cursor:
             row = await cursor.fetchone()
-        assert row[0] == "3"
+        assert row[0] == "4"
 
         loaded = await store.load_session("legacy1")
         assert loaded is not None
@@ -487,7 +487,7 @@ async def test_v1_database_migrates_to_v3_legacy_row_defaults_docs_and_dialect(t
             "SELECT v FROM meta WHERE k = 'schema_version'"
         ) as cursor:
             row = await cursor.fetchone()
-        assert row[0] == "3"
+        assert row[0] == "4"
 
         loaded = await store.load_session("legacy0")
         assert loaded is not None

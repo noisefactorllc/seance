@@ -972,7 +972,7 @@ def test_freeze_thaw_round_trip(clock):
     # exactly the store contract keys
     assert set(payload) == {
         "created_by", "dialect", "created_at", "settings", "state", "data", "poly",
-        "docs", "chat", "rev", "seq", "frozen_at", "last_active",
+        "docs", "chat", "rev", "seq", "frozen_at", "last_active", "first_joined_at",
     }
     assert payload["frozen_at"] is None
     assert payload["settings"]["readonly_users"] == ["ro-user"]
