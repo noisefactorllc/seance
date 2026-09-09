@@ -20,7 +20,10 @@ This module owns everything between a raw upgrade request and the synchronous
 * deterministic **teardown** — the writer flushes any queued close frame, the
   helper tasks are stopped, and the hub is told the connection left.
 
-Time is injected as ``clock``. Tokens, cookies, and frame payloads are never
+Time is injected as ``clock`` and defaults to ``time.monotonic``: everything
+timed here (pong liveness, the join window, the lane buckets) is a duration that
+never leaves the process, so a wall-clock step must not be able to expire every
+connection or refuse every lane. Tokens, cookies, and frame payloads are never
 logged.
 """
 
@@ -256,9 +259,13 @@ def make_websocket_handler(
     config: Config,
     hub: Hub,
     identity_service: IdentityService,
-    clock: Callable[[], float] = time.time,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Callable[[web.Request], object]:
-    """Build the ``GET /v1/sessions/{id}/ws`` handler bound to the app's services."""
+    """Build the ``GET /v1/sessions/{id}/ws`` handler bound to the app's services.
+
+    ``clock`` drives only liveness and rate limiting (durations), so it is
+    monotonic by default; the Session's wall-clock stamping is the hub's clock.
+    """
     limits = config.limits
     allowed_origins = config.allowed_origins
     trusted_proxies = config.trusted_proxies

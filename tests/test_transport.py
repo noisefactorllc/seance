@@ -622,3 +622,12 @@ async def test_up_smoke_via_create_app(tmp_path):
             }
     finally:
         await server.close()
+
+
+def test_transport_liveness_clock_defaults_to_monotonic():
+    """Heartbeat deadlines and lane buckets are durations: immune to wall-clock steps."""
+    import inspect
+    import time
+
+    default = inspect.signature(make_websocket_handler).parameters["clock"].default
+    assert default is time.monotonic

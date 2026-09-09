@@ -15,7 +15,9 @@ Two complementary, pure, clock-injectable primitives:
   the oldest windows.
 
 No locks: every call is synchronous and the server runs a single event loop.
-Time is injected as ``clock`` so tests advance logic time without sleeping.
+Time is injected as ``clock`` so tests advance logic time without sleeping; the
+transport injects a monotonic clock, and a backwards step is treated as zero
+elapsed time rather than as a debt.
 """
 
 from __future__ import annotations
@@ -50,13 +52,14 @@ class Bucket:
         request only if the post-refill balance covers ``n`` in full — there are
         no partial grants.
 
-        Two edge behaviors follow from the token math: a request for ``n >
-        burst`` can never succeed, because the balance is capped at ``burst``;
-        and a backwards clock rewind (``now < last``) drives the balance
-        negative, so the bucket fails closed until forward time refills it.
+        A request for ``n > burst`` can never succeed, because the balance is
+        capped at ``burst``. A backwards clock step (``now < last``) counts as
+        zero elapsed time: it neither refills nor drains the bucket, so a
+        wall-clock correction cannot turn every lane into a refusal streak.
         """
         now = self.clock()
-        self.tokens = min(float(self.burst), self.tokens + (now - self.last) * self.rate)
+        elapsed = max(0.0, now - self.last)
+        self.tokens = min(float(self.burst), self.tokens + elapsed * self.rate)
         self.last = now
         if self.tokens >= n:
             self.tokens -= n

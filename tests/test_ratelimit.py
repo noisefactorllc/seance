@@ -229,3 +229,25 @@ def test_default_clock_grants_initial_burst():
     assert Bucket(rate=1.0, burst=1).take() is True
     assert LaneLimiter(Limits(chat_burst=1)).take("chat") is True
     assert KeyedLimiter(limit=1, window_secs=60.0).take("k") is True
+
+
+def test_bucket_backwards_clock_step_counts_as_zero_elapsed(clock):
+    """A wall-clock correction must not drive a lane into a refusal streak."""
+    bucket = Bucket(rate=60.0, burst=120, clock=clock)
+    for _ in range(10):
+        assert bucket.take()
+    clock.advance(-30.0)
+    assert bucket.take()  # not fail-closed for the next 30 s
+    assert bucket.tokens == pytest.approx(109.0)
+    clock.advance(1.0)  # refills from the stepped-back instant onward
+    assert bucket.take()
+    assert bucket.tokens == pytest.approx(119.0)
+
+
+def test_lane_limiter_no_exhaustion_streak_after_backwards_step(clock):
+    limiter = LaneLimiter(Limits(), clock)
+    for _ in range(10):
+        assert limiter.take("fast")
+    clock.advance(-30.0)
+    assert limiter.take("fast")
+    assert limiter.exhausted_since("fast") is None
