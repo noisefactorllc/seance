@@ -372,6 +372,18 @@ class Hub:
         else:
             self.empty_since.pop(session.session_id, None)
 
+    def close_connections(self, code: int, reason: str = "") -> None:
+        """Schedule a close on every live connection (server shutdown).
+
+        Each transport writer sends the close frame and its handler then tears
+        the connection down through the normal path, so aiohttp's shutdown wait
+        ends as soon as the handlers return instead of after its full timeout,
+        and :meth:`stop` (on cleanup) freezes sessions that are already empty.
+        """
+        for session in self.live.values():
+            for conn in list(session.conns.values()):
+                conn.close_soon(code, reason)
+
     # --------------------------------------------------------------------- #
     # Freeze / checkpoint
     # --------------------------------------------------------------------- #

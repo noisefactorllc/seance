@@ -5,8 +5,9 @@ a :class:`app.config.Config`, opens the :class:`app.store.Store`, resolves the
 member :class:`app.directory.MemberDirectory`, and constructs the
 :class:`app.identity.IdentityService`, the :class:`app.hub.Hub`, and the transport
 WebSocket handler, then assembles them with :func:`app.httpapi.build_app`. The
-hub's background freeze/checkpoint loop is started on app startup and stopped —
-with every live session frozen and the store closed — on cleanup.
+hub's background freeze/checkpoint loop is started on app startup; on shutdown
+every WebSocket is closed with ``1001`` (going away) so aiohttp's handler wait
+ends promptly, and on cleanup every live session is frozen and the store closed.
 
 :func:`run` is the ``bin/app.py`` entrypoint. It fails fast on a configuration
 error (printing it and exiting non-zero) and otherwise hands the app coroutine to
@@ -35,6 +36,14 @@ from app.transport import make_websocket_handler
 
 _LOG = logging.getLogger("seance.main")
 
+# RFC 6455 "going away": sent to every connected client when the server stops.
+_CLOSE_GOING_AWAY = 1001
+# How long aiohttp waits for in-flight handlers after ``on_shutdown``. The
+# handlers finish within a second once their sockets are closed above, so this
+# only bounds a stalled peer; it must stay well inside the container's stop
+# grace period, which also has to cover freezing every live session.
+_SHUTDOWN_TIMEOUT = 10.0
+
 
 async def create_app(env: Mapping[str, str]) -> web.Application:
     """Compose the fully-wired seance application from an environment mapping."""
@@ -54,6 +63,12 @@ async def create_app(env: Mapping[str, str]) -> web.Application:
             "seance %s listening on %s:%s", __version__, config.bind_host, config.bind_port
         )
 
+    async def _on_shutdown(_app: web.Application) -> None:
+        # Runs before aiohttp waits for in-flight handlers: closing every
+        # WebSocket with 1001 lets those handlers return at once, so a SIGTERM
+        # completes in seconds (freeze included) rather than after the wait.
+        hub.close_connections(_CLOSE_GOING_AWAY, "server shutting down")
+
     async def _on_cleanup(_app: web.Application) -> None:
         await hub.stop()
         await store.close()
@@ -61,6 +76,7 @@ async def create_app(env: Mapping[str, str]) -> web.Application:
             await directory.close()
 
     app.on_startup.append(_on_startup)
+    app.on_shutdown.append(_on_shutdown)
     app.on_cleanup.append(_on_cleanup)
     return app
 
@@ -88,4 +104,9 @@ def run() -> None:
     except ConfigError as exc:
         print(f"seance: configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    web.run_app(create_app(os.environ), host=config.bind_host, port=config.bind_port)
+    web.run_app(
+        create_app(os.environ),
+        host=config.bind_host,
+        port=config.bind_port,
+        shutdown_timeout=_SHUTDOWN_TIMEOUT,
+    )

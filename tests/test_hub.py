@@ -709,3 +709,17 @@ async def test_snapshot_node_kind_too_long_rejected_400(hub_factory, clock):
     # a 32-char kind is within the cap and creates the session
     ok = {"poly": {"programText": "p", "nodes": [{"id": "root", "kind": "k" * 32, "text": ""}]}}
     assert len(await hub.create_session(member("b"), ok)) == 6
+
+
+async def test_close_connections_schedules_close_on_every_live_connection(hub_factory, clock):
+    hub, _ = await hub_factory()
+    sid_a = await hub.create_session(member("u1"))
+    sid_b = await hub.create_session(member("u1"))
+    conns = [FakeConn(member("u1")), FakeConn(member("u2")), FakeConn(member("u3"))]
+    await hub.connect(sid_a, conns[0])
+    await hub.connect(sid_a, conns[1])
+    await hub.connect(sid_b, conns[2])
+
+    hub.close_connections(1001, "server shutting down")
+
+    assert [c.closed for c in conns] == [(1001, "server shutting down")] * 3
