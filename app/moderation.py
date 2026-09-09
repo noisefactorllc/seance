@@ -50,6 +50,12 @@ def _ban(session: Session, actor: ConnLike, msg: dict) -> None:
     if target == actor.identity.user_id:
         session.send_error(actor, ErrorCode.forbidden, detail="cannot target self")
         return
+    if target == session.created_by:
+        # An acting owner (possibly an anonymous guest who inherited the role
+        # while the creator was away) must not be able to lock the creator out
+        # of their own session; bans persist and nobody else could lift it.
+        session.send_error(actor, ErrorCode.forbidden, detail="cannot ban the session creator")
+        return
     session.bans.add(target)
     session.fire_ban_sink(target, actor.identity.username, True)
     session.kick_user(target)  # no-op when the target is offline

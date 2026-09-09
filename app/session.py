@@ -493,7 +493,14 @@ class Session:
         identity = conn.identity
         if identity.user_id in self.bans:
             raise JoinRefused(protocol.CLOSE_FORBIDDEN, "banned")
-        if self.settings.locked:
+        # A lock keeps newcomers out; it must not strand the people who hold the
+        # keys. The creator and an explicitly transferred owner may always
+        # re-enter (a reload or a thaw would otherwise seal the session forever,
+        # since the lock is persisted and no other unlock path exists).
+        if self.settings.locked and identity.user_id not in (
+            self.created_by,
+            self.settings.explicit_owner,
+        ):
             raise JoinRefused(protocol.CLOSE_LOCKED, "locked")
         if not self.settings.guests_allowed and identity.kind in _GUEST_KINDS:
             raise JoinRefused(protocol.CLOSE_FORBIDDEN, "guests not allowed")
