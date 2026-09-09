@@ -974,3 +974,60 @@ def test_freeze_thaw_round_trip(clock):
     t.handle(o2.connection_id, {"type": "state-update", "id": "k2", "value": 2})
     k2_entry = [e for e in t.state.snapshot() if e["id"] == "k2"][0]
     assert k2_entry["seq"] > seq_before
+
+
+def test_incremental_budget_accounting_matches_full_serialization(clock):
+    """data-update, poly upsert/delete and doc-edit account per item, exactly.
+
+    Every step (including budget refusals and their in-place rollbacks) must
+    leave the cached totals equal to a full re-serialization of the content.
+    """
+    from random import Random
+
+    rng = Random(7)
+    limits = Limits(
+        max_session_bytes=5000, max_doc_oplog=6, max_doc_oplog_bytes=1500, chat_history=5
+    )
+    s = Session("s", "owner", limits, clock)
+    owner, w = FakeConn(member("owner")), FakeConn(member("w"))
+    s.join(owner)
+    s.join(w)
+    s.handle(owner.connection_id, {"type": "doc-create", "doc": {
+        "id": "d", "title": "t", "kind": "k", "text": "seed", "default": True}})
+    seq = 0
+    refusals = 0
+    for _ in range(400):
+        blob = "x" * rng.randint(0, 400)
+        op = rng.random()
+        before = len(w.sent)
+        if op < 0.3:
+            s.handle(w.connection_id, {"type": "data-update", "id": rng.choice("ab"),
+                                       "role": rng.choice("rs"), "key": rng.choice("xyz"),
+                                       "value": blob})
+        elif op < 0.55:
+            s.handle(w.connection_id, {"type": "poly-token-upsert", "base_rev": s.poly.rev,
+                                       "id": rng.choice(["n1", "n2", "n1.c", "n1.c.d"]),
+                                       "kind": "k", "text": blob, "parentId": None})
+        elif op < 0.7:
+            s.handle(w.connection_id, {"type": "poly-token-delete", "base_rev": s.poly.rev,
+                                       "id": rng.choice(["n1", "n2", "n9"])})
+        else:
+            text = s.docs.snapshot()[0]["text"]
+            pos = rng.randint(0, len(text))
+            seq += 1
+            s.handle(w.connection_id, {"type": "doc-edit", "docId": "d",
+                                       "baseRev": s.docs.snapshot()[0]["rev"],
+                                       "authorSeq": seq,
+                                       "edit": {"start": pos,
+                                                "end": min(len(text), pos + rng.randint(0, 3)),
+                                                "text": blob[:60]}})
+        refusals += sum(
+            1 for f in w.sent[before:]
+            if f["type"] == "error" or f.get("reason") in ("limit", "too_large")
+        )
+        payload = s._content_payload()
+        assert s._content_bytes == protocol.json_size(payload)
+        assert s._content_component_sizes == {
+            k: protocol.json_size(v) for k, v in payload.items()
+        }
+    assert refusals > 0, "the budget was never hit; the rollback paths went untested"

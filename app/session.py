@@ -211,7 +211,80 @@ class Session:
         self._state_entry_sizes = {
             item["id"]: protocol.json_size(item) for item in payload["state"]
         }
+        self._refresh_lane_sizes("poly", payload["poly"])
+        self._refresh_lane_sizes("docs", payload["docs"])
         self._content_bytes = protocol.json_size(payload)
+
+    def _refresh_lane_sizes(self, name: str, serialized) -> None:
+        """Rebuild the per-node (poly) or per-document (docs) size caches.
+
+        The proposal-lane handlers account for one node or one document per
+        frame from these caches instead of copying and re-serializing the whole
+        lane. ``serialized`` is the lane's persistence form, so a full commit
+        (snapshot lane) refreshes them from what it already serialized.
+        """
+        if name == "poly":
+            self._poly_node_sizes = {
+                node["id"]: protocol.json_size(node) for node in serialized["nodes"]
+            }
+            self._poly_nodes_total = sum(self._poly_node_sizes.values())
+            # The lane minus its node entries and rev digits ("rev": 0 is one digit).
+            self._poly_static_size = (
+                protocol.json_size(
+                    {
+                        "rev": 0,
+                        "programText": serialized["programText"],
+                        "frame": serialized["frame"],
+                        "nodes": [],
+                    }
+                )
+                - 1
+            )
+        elif name == "docs":
+            self._doc_sizes = {doc["id"]: protocol.json_size(doc) for doc in serialized}
+
+    def _poly_lane_size(self) -> int:
+        """Exact compact-JSON bytes of ``poly.snapshot()``, from the node cache."""
+        count = len(self._poly_node_sizes)
+        return (
+            self._poly_static_size
+            + len(str(self.poly.rev))
+            + self._poly_nodes_total
+            + max(0, count - 1)
+        )
+
+    def _record_lane_size(self, name: str, size: int) -> None:
+        self._content_bytes += size - self._content_component_sizes[name]
+        self._content_component_sizes[name] = size
+
+    def _frozen_doc_size(self, doc_id: str) -> int:
+        """Exact compact-JSON bytes of one document's persistence form (op log included)."""
+        view = TextDocCollection(self.limits)
+        view._docs = {doc_id: self.docs._docs[doc_id]}
+        return protocol.json_size(self._frozen_docs(view)[0])
+
+    @staticmethod
+    def _doc_state(doc) -> tuple:
+        """Capture what an edit mutates, so a refused edit can be undone in place."""
+        return (
+            doc._text,
+            doc._rev,
+            list(doc._oplog),
+            doc._oplog_bytes,
+            dict(doc._retry_cache),
+            dict(doc._author_seq_highwater),
+        )
+
+    @staticmethod
+    def _restore_doc_state(doc, state: tuple) -> None:
+        (
+            doc._text,
+            doc._rev,
+            doc._oplog,
+            doc._oplog_bytes,
+            doc._retry_cache,
+            doc._author_seq_highwater,
+        ) = state
 
     def recalculate_content_budget(self) -> None:
         """Recalculate accounting after a trusted bulk load or creator snapshot."""
@@ -220,7 +293,10 @@ class Session:
     def _commit_content(self, name: str, candidate, serialized) -> bool:
         """Atomically replace one content lane when its aggregate size is allowed."""
         candidate_size = protocol.json_size(serialized)
-        return self._commit_content_size(name, candidate, candidate_size)
+        if not self._commit_content_size(name, candidate, candidate_size):
+            return False
+        self._refresh_lane_sizes(name, serialized)
+        return True
 
     def _commit_content_size(self, name: str, candidate, candidate_size: int) -> bool:
         """Commit one lane using an already-computed exact serialized size."""
@@ -590,13 +666,42 @@ class Session:
 
     def _do_data_update(self, conn: ConnLike, msg: dict) -> None:
         identity = conn.identity
-        candidate = copy.deepcopy(self.data)
+        data_id, role, key, value = msg["id"], msg["role"], msg["key"], msg["value"]
+        lane = self.data._data
+        roles = lane.get(data_id)
+        keys = roles.get(role) if roles is not None else None
+        had_leaf = keys is not None and key in keys
+        previous = keys[key] if had_leaf else None
+        # Container sizes before the write decide the separator bytes below.
+        n_ids, n_roles, n_keys = len(lane), len(roles or ()), len(keys or ())
         try:
-            candidate.apply(msg["id"], msg["role"], msg["key"], msg["value"])
+            self.data.apply(data_id, role, key, value)
         except EngineLimit as exc:
             self.send_error(conn, ErrorCode.too_large, detail=exc.detail)
             return
-        if not self._commit_content("data", candidate, candidate.snapshot()):
+        # Exact compact-JSON delta of data[id][role][key] = value: a changed leaf
+        # swaps its value bytes; a new leaf/role/id adds its key, colon and
+        # braces, plus a comma when the enclosing container was non-empty.
+        leaf = protocol.json_size(key) + 1 + protocol.json_size(value)
+        if had_leaf:
+            delta = protocol.json_size(value) - protocol.json_size(previous)
+        elif keys is not None:
+            delta = leaf + (1 if n_keys else 0)
+        elif roles is not None:
+            delta = protocol.json_size(role) + 3 + leaf + (1 if n_roles else 0)
+        else:
+            delta = protocol.json_size(data_id) + 3 + protocol.json_size(role) + 3 + leaf
+            delta += 1 if n_ids else 0
+        data_size = self._content_component_sizes["data"] + delta
+        if not self._commit_content_size("data", self.data, data_size):
+            if had_leaf:
+                keys[key] = previous
+            elif keys is not None:
+                del keys[key]
+            elif roles is not None:
+                del roles[role]
+            else:
+                del lane[data_id]
             self.send_error(conn, ErrorCode.too_large, detail="session content budget exceeded")
             return
         self._broadcast(
@@ -720,55 +825,83 @@ class Session:
 
     def _do_poly_upsert(self, conn: ConnLike, msg: dict) -> None:
         identity = conn.identity
-        candidate = copy.deepcopy(self.poly)
-        result = candidate.upsert(
+        author = self._author_key(identity, conn.connection_id)
+        node_id = msg["id"]
+        poly = self.poly
+        # Applied in place; enough is captured to undo a budget refusal exactly
+        # (only an author evicted from the dedup map at its cap is not restored).
+        saved = (poly.nodes.get(node_id), poly.rev, poly._author_seq.get(author))
+        result = poly.upsert(
             base_rev=msg["base_rev"],
-            node_id=msg["id"],
+            node_id=node_id,
             kind=msg["kind"],
             text=msg["text"],
             parent_id=msg.get("parentId"),
-            author=self._author_key(identity, conn.connection_id),
+            author=author,
             author_seq=msg.get("author_seq"),
         )
-        self._poly_result(conn, msg, result, candidate, upsert=True)
+        if result.status == "applied":
+            node = poly.nodes[node_id]
+            node_size = protocol.json_size(
+                {
+                    "id": node.id,
+                    "kind": node.kind,
+                    "text": node.text,
+                    "version": node.version,
+                    "parentId": node.parent_id,
+                }
+            )
+            previous = self._poly_node_sizes.get(node_id)
+            self._poly_nodes_total += node_size - (previous or 0)
+            self._poly_node_sizes[node_id] = node_size
+            if not self._commit_content_size("poly", poly, self._poly_lane_size()):
+                self._poly_nodes_total -= node_size - (previous or 0)
+                if previous is None:
+                    del self._poly_node_sizes[node_id]
+                else:
+                    self._poly_node_sizes[node_id] = previous
+                old_node, old_rev, old_author = saved
+                if old_node is None:
+                    poly.nodes.pop(node_id, None)
+                else:
+                    poly.nodes[node_id] = old_node
+                poly.rev = old_rev
+                if old_author is None:
+                    poly._author_seq.pop(author, None)
+                else:
+                    poly._author_seq[author] = old_author
+                self._send_poly_reject(conn, msg, "limit", poly.rev)
+                return
+        self._poly_result(conn, msg, result, upsert=True)
 
     def _do_poly_delete(self, conn: ConnLike, msg: dict) -> None:
         identity = conn.identity
-        candidate = copy.deepcopy(self.poly)
-        result = candidate.delete(
+        result = self.poly.delete(
             base_rev=msg["base_rev"],
             node_id=msg["id"],
             author=self._author_key(identity, conn.connection_id),
             author_seq=msg.get("author_seq"),
         )
-        self._poly_result(conn, msg, result, candidate, upsert=False)
+        if result.status == "applied":
+            for entry in result.applied:
+                self._poly_nodes_total -= self._poly_node_sizes.pop(entry["id"])
+            # A delete never grows the lane, so it is recorded rather than gated.
+            self._record_lane_size("poly", self._poly_lane_size())
+        self._poly_result(conn, msg, result, upsert=False)
 
-    def _poly_result(self, conn: ConnLike, msg: dict, result, candidate, *, upsert: bool) -> None:
+    def _send_poly_reject(self, conn: ConnLike, msg: dict, reason: str, rev: int) -> None:
+        body = {"type": "poly-reject", "reason": reason, "id": msg["id"], "rev": rev}
+        if "author_seq" in msg:
+            body["author_seq"] = msg["author_seq"]
+        self._send(conn, body)
+
+    def _poly_result(self, conn: ConnLike, msg: dict, result, *, upsert: bool) -> None:
         if result.status == "duplicate":
             return  # a retransmit — total silence
         if result.status == "rejected":
-            self.poly = candidate  # retain the bounded author-sequence high-water mark
-            body = {
-                "type": "poly-reject",
-                "reason": result.reason,
-                "id": msg["id"],
-                "rev": result.rev,
-            }
-            if "author_seq" in msg:
-                body["author_seq"] = msg["author_seq"]
-            self._send(conn, body)
-            return
-
-        if not self._commit_content("poly", candidate, candidate.snapshot()):
-            body = {
-                "type": "poly-reject",
-                "reason": "limit",
-                "id": msg["id"],
-                "rev": self.poly.rev,
-            }
-            if "author_seq" in msg:
-                body["author_seq"] = msg["author_seq"]
-            self._send(conn, body)
+            # The engine, applied in place, already kept the author-sequence
+            # high-water mark for the rejected proposal.
+            self._send_poly_reject(conn, msg, result.reason, result.rev)
             return
 
         identity = conn.identity
@@ -886,11 +1019,15 @@ class Session:
         self._broadcast_doc_snapshot()
 
     def _do_doc_edit(self, conn: ConnLike, msg: dict) -> None:
-        duplicate = self._doc_duplicate_retry(msg["docId"], conn.connection_id, msg["authorSeq"])
-        candidate = copy.deepcopy(self.docs)
+        doc_id = msg["docId"]
+        duplicate = self._doc_duplicate_retry(doc_id, conn.connection_id, msg["authorSeq"])
+        # Applied in place; a refused edit (engine or budget) is undone from the
+        # captured state so it leaves no trace, retry cache included.
+        doc = self.docs._docs.get(doc_id)
+        saved = None if doc is None else self._doc_state(doc)
         try:
-            accepted = candidate.apply_edit(
-                msg["docId"],
+            accepted = self.docs.apply_edit(
+                doc_id,
                 base_rev=msg["baseRev"],
                 edit=TextEdit(**msg["edit"]),
                 author_id=conn.identity.user_id,
@@ -898,26 +1035,32 @@ class Session:
                 author_seq=msg["authorSeq"],
             )
         except TextDocReject as exc:
+            if doc is not None:
+                self._restore_doc_state(doc, saved)
             self._send_doc_reject(
                 conn,
-                doc_id=msg["docId"],
+                doc_id=doc_id,
                 base_rev=msg["baseRev"],
                 author_seq=msg["authorSeq"],
                 reason=exc.reason,
-                snapshot=self._doc_snapshot(msg["docId"]),
+                snapshot=self._doc_snapshot(doc_id),
             )
             return
 
-        if not self._commit_content("docs", candidate, self._frozen_docs(candidate)):
+        doc_size = self._frozen_doc_size(doc_id)
+        docs_size = self._content_component_sizes["docs"] - self._doc_sizes[doc_id] + doc_size
+        if not self._commit_content_size("docs", self.docs, docs_size):
+            self._restore_doc_state(doc, saved)
             self._send_doc_reject(
                 conn,
-                doc_id=msg["docId"],
+                doc_id=doc_id,
                 base_rev=msg["baseRev"],
                 author_seq=msg["authorSeq"],
                 reason="too_large",
-                snapshot=self._doc_snapshot(msg["docId"]),
+                snapshot=self._doc_snapshot(doc_id),
             )
             return
+        self._doc_sizes[doc_id] = doc_size
 
         self._send(
             conn,
