@@ -435,7 +435,10 @@ class Hub:
 
         Settles pending write-throughs first so a ban lands before its session is
         frozen. Freezes every empty session past ``freeze_grace``, then
-        checkpoints any live session past ``checkpoint_ops`` or ``checkpoint_secs``.
+        checkpoints any live session that has *changed* since its last save and
+        is past ``checkpoint_ops`` or ``checkpoint_secs``. A join bumps ``seq``
+        (welcome plus snapshot), so the first pass after a connect still saves
+        and clears the stale ``frozen_at`` marker.
         """
         await self._drain_pending()
         await self._settle_bg()
@@ -449,8 +452,14 @@ class Hub:
         for session_id in list(self.live):
             session = self.live[session_id]
             dirty = session.seq - self.last_saved_seq.get(session_id, 0)
-            idle = now - self.last_saved_at.get(session_id, 0.0)
-            if dirty >= self.limits.checkpoint_ops or idle >= self.limits.checkpoint_secs:
+            if dirty <= 0:
+                # Nothing has happened since the last save. The time test below
+                # measures seconds since that save, not since the last activity,
+                # so without this an idle session is re-serialized and rewritten
+                # every checkpoint_secs forever.
+                continue
+            since_save = now - self.last_saved_at.get(session_id, 0.0)
+            if dirty >= self.limits.checkpoint_ops or since_save >= self.limits.checkpoint_secs:
                 await self._checkpoint_live(session)
 
         if self._frozen_session_ttl > 0:

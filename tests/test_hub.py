@@ -438,6 +438,37 @@ async def test_checkpoint_triggered_on_ops_threshold(hub_factory, clock):
     assert sid in hub.live
 
 
+async def test_idle_session_is_not_rewritten_when_nothing_changed(hub_factory, clock):
+    """A checkpoint is for durability of changes, not a heartbeat.
+
+    ``checkpoint_secs`` measures time since the last save, so an idle session
+    used to be re-serialized and rewritten to SQLite on every pass forever.
+    """
+    hub, store = await hub_factory(checkpoint_secs=30.0)
+    owner = FakeConn(member("owner"))
+    sid = await hub.create_session(member("owner"))
+    session = await hub.connect(sid, owner)
+
+    # The join is a change (welcome plus snapshot bump seq), so the first pass
+    # past checkpoint_secs still saves and clears the create-time frozen marker.
+    clock.advance(hub.limits.checkpoint_secs + 1)
+    await hub.scan()
+    assert (await store.load_session(sid))["frozen_at"] is None
+    first_save = hub.last_saved_at[sid]
+
+    for _ in range(5):
+        clock.advance(hub.limits.checkpoint_secs + 1)
+        await hub.scan()
+    assert hub.last_saved_at[sid] == first_save  # no save happened
+    assert sid in hub.live
+
+    session.handle(owner.connection_id, {"type": "state-update", "id": "k", "value": 1})
+    clock.advance(hub.limits.checkpoint_secs + 1)
+    await hub.scan()
+    assert hub.last_saved_at[sid] > first_save
+    assert (await store.load_session(sid))["seq"] == session.seq
+
+
 # --------------------------------------------------------------------------- #
 # start / stop
 # --------------------------------------------------------------------------- #
