@@ -21,6 +21,8 @@ from app.protocol import (
     CLOSE_SLOW,
     CONTROL_LANE,
     FAST_LANE,
+    MAX_FRAME_DEPTH,
+    MAX_SAFE_INT,
     MOD_TYPES,
     OWNER_TYPES,
     PROPOSAL_LANE,
@@ -331,6 +333,40 @@ def test_parse_frame_size_is_utf8_bytes():
     assert exc.value.code is ErrorCode.too_large
 
 
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_parse_frame_rejects_non_finite_constants(literal, limits):
+    # Python's json accepts these; no browser can parse them back, and the
+    # server would relay and persist them into every later snapshot.
+    with pytest.raises(ProtocolError) as exc:
+        parse_frame(
+            '{"type":"state-update","id":"k","value":' + literal + "}",
+            max_len=limits.max_frame,
+        )
+    assert exc.value.code is ErrorCode.bad_frame
+
+
+def test_parse_frame_accepts_nesting_at_the_depth_cap(limits):
+    raw = '{"type":"state-update","id":"k","value":'
+    raw += "[" * (MAX_FRAME_DEPTH - 1) + "]" * (MAX_FRAME_DEPTH - 1) + "}"
+    assert parse_frame(raw, max_len=limits.max_frame)["id"] == "k"
+
+
+def test_parse_frame_rejects_nesting_past_the_depth_cap(limits):
+    # Deeper than copy.deepcopy can walk: the session copies a lane per write.
+    raw = '{"type":"state-update","id":"k","value":'
+    raw += "[" * (MAX_FRAME_DEPTH + 1) + "]" * (MAX_FRAME_DEPTH + 1) + "}"
+    with pytest.raises(ProtocolError) as exc:
+        parse_frame(raw, max_len=limits.max_frame)
+    assert exc.value.code is ErrorCode.bad_frame
+
+
+def test_parse_frame_rejects_nesting_far_past_any_recursion_limit(limits):
+    raw = '{"v":' + "[" * 30_000 + "]" * 30_000 + "}"
+    with pytest.raises(ProtocolError) as exc:
+        parse_frame(raw, max_len=len(raw) + 1)
+    assert exc.value.code is ErrorCode.bad_frame
+
+
 # --------------------------------------------------------------------------- #
 # validate_message: acceptance of every canonical client type
 # --------------------------------------------------------------------------- #
@@ -599,6 +635,63 @@ def test_validate_upsert_negative_author_seq(limits):
         )
     assert exc.value.code is ErrorCode.bad_frame
     assert exc.value.ref_type == "author_seq"
+
+
+def test_validate_rejects_nesting_past_the_depth_cap(limits):
+    value = []
+    for _ in range(MAX_FRAME_DEPTH + 1):
+        value = [value]
+    with pytest.raises(ProtocolError) as exc:
+        validate_message({"type": "state-update", "id": "k", "value": value}, limits)
+    assert exc.value.code is ErrorCode.bad_frame
+
+
+def test_validate_accepts_integer_at_the_javascript_safe_ceiling(limits):
+    result = validate_message(
+        {
+            "type": "doc-edit",
+            "docId": "d",
+            "baseRev": MAX_SAFE_INT,
+            "authorSeq": 1,
+            "edit": {"start": 0, "end": 0, "text": "x"},
+        },
+        limits,
+    )
+    assert result["baseRev"] == MAX_SAFE_INT
+
+
+@pytest.mark.parametrize("field", ["baseRev", "authorSeq"])
+def test_validate_rejects_integer_beyond_the_javascript_safe_ceiling(field, limits):
+    # The server echoes these back; JSON.parse turns anything larger into a
+    # float, and a 400-digit literal into Infinity.
+    msg = {
+        "type": "doc-edit",
+        "docId": "d",
+        "baseRev": 0,
+        "authorSeq": 1,
+        "edit": {"start": 0, "end": 0, "text": "x"},
+    }
+    msg[field] = MAX_SAFE_INT + 1
+    with pytest.raises(ProtocolError) as exc:
+        validate_message(msg, limits)
+    assert exc.value.code is ErrorCode.bad_frame
+    assert exc.value.ref_type == field
+
+
+def test_validate_doc_edit_rejects_end_before_start(limits):
+    with pytest.raises(ProtocolError) as exc:
+        validate_message(
+            {
+                "type": "doc-edit",
+                "docId": "d",
+                "baseRev": 0,
+                "authorSeq": 1,
+                "edit": {"start": 5, "end": 2, "text": ""},
+            },
+            limits,
+        )
+    assert exc.value.code is ErrorCode.bad_frame
+    assert exc.value.ref_type == "edit"
 
 
 def test_validate_poly_cursor_node_mode(limits):

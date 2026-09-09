@@ -542,6 +542,46 @@ def test_delete_stale_rejected_and_mutates_nothing():
 # --------------------------------------------------------------------------- #
 
 
+def test_upsert_future_base_rev_rejected_stale_and_mutates_nothing():
+    """A base_rev the server has not reached describes no state the author saw.
+
+    Accepting it would skip the per-node version check, which is this lane's
+    only concurrency control.
+    """
+    doc = _root_doc()  # rev 1
+    doc.upsert(
+        base_rev=1, node_id="root.0", kind="s", text="x",
+        parent_id="root", author="a", author_seq=None,
+    )  # rev 2, root.0 at version 2
+    before = doc.snapshot()
+
+    r = doc.upsert(
+        base_rev=10**9, node_id="root.0", kind="s", text="clobber",
+        parent_id="root", author="b", author_seq=None,
+    )
+
+    assert r.status == "rejected"
+    assert r.reason == "stale"
+    assert r.rev == 2
+    assert doc.snapshot() == before
+
+
+def test_delete_future_base_rev_rejected_stale_and_mutates_nothing():
+    doc = _root_doc()  # rev 1
+    doc.upsert(
+        base_rev=1, node_id="root.0", kind="s", text="x",
+        parent_id="root", author="a", author_seq=None,
+    )  # rev 2
+    before = doc.snapshot()
+
+    r = doc.delete(base_rev=10**9, node_id="root.0", author="b", author_seq=None)
+
+    assert r.status == "rejected"
+    assert r.reason == "stale"
+    assert r.rev == 2
+    assert doc.snapshot() == before
+
+
 def test_upsert_bool_base_rev_rejected_stale_and_mutates_nothing():
     doc = _root_doc()  # rev 1
     before = doc.snapshot()

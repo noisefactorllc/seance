@@ -125,6 +125,29 @@ def test_ban_offline_user_still_persists(clock):
     assert h.bans_fired == [("sess", "absent-user", "owner", True)]
 
 
+def test_acting_owner_cannot_ban_the_session_creator(clock):
+    """An acting owner (a guest who inherited the role) must not lock the creator out.
+
+    Bans persist and only an owner can lift one, so banning ``created_by`` is a
+    permanent takeover of somebody else's session.
+    """
+    h = Harness(clock)
+    guest = FakeConn(anon("ag"))
+    h.session.join(guest)
+    for connection_id in [c.connection_id for c in (h.owner, h.mem)]:
+        h.session.leave(connection_id)
+    assert h.session.owner_user_id == "ag"
+
+    guest.sent.clear()
+    h.session.handle(guest.connection_id, {"type": "mod-ban", "target_user": "owner"})
+
+    assert frames(guest, "error")[0]["code"] == "forbidden"
+    assert "owner" not in h.session.bans
+    assert h.bans_fired == []
+    assert h.audits == []
+    h.session.join(FakeConn(member("owner")))  # the creator can still return
+
+
 def test_unban_fires_sink_and_readmits(clock):
     h = Harness(clock)
     h.owner_do({"type": "mod-ban", "target_user": "m"})
@@ -167,6 +190,40 @@ def test_lock_toggles_and_blocks_new_joins(clock):
         raise AssertionError("locked session should refuse new joins")
     h.owner_do({"type": "mod-lock", "locked": False})
     assert h.session.settings.locked is False
+
+
+def test_lock_still_admits_the_creator_and_an_explicit_owner(clock):
+    """A lock keeps newcomers out; it must not seal the session against its keys.
+
+    The lock is persisted, so an owner who locks and then reloads (or whose
+    session freezes) would otherwise never get back in to lift it.
+    """
+    h = Harness(clock)
+    h.owner_do({"type": "mod-lock", "locked": True})
+    h.owner_do({"type": "mod-transfer", "target_user": "m"})
+    assert h.session.settings.explicit_owner == "m"
+
+    h.session.join(FakeConn(member("owner")))  # created_by
+    h.session.join(FakeConn(member("m")))  # explicit_owner
+
+    try:
+        h.session.join(FakeConn(member("newbie")))
+    except JoinRefused as exc:
+        assert exc.close_code == protocol.CLOSE_LOCKED
+    else:
+        raise AssertionError("locked session should still refuse other joins")
+
+
+def test_lock_admits_the_creator_after_freeze_and_thaw(clock):
+    h = Harness(clock)
+    h.owner_do({"type": "mod-lock", "locked": True})
+    for connection_id in list(h.session.conns):
+        h.session.leave(connection_id)
+
+    thawed = Session.thaw("sess", h.session.freeze_snapshot(), Limits(), clock)
+
+    thawed.join(FakeConn(member("owner")))
+    assert thawed.settings.locked is True
 
 
 def test_guests_toggle_boots_nobody_but_blocks_new_anon(clock):

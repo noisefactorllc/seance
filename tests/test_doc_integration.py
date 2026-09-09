@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 from cryptography.fernet import Fernet
 
@@ -385,6 +386,102 @@ async def test_doc_state_persists_across_freeze_thaw_and_retains_transform_windo
         assert len(ack) == 1
         assert ack[0]["rev"] == 2
         assert ack[0]["edit"] == {"start": 5, "end": 5, "text": "Y"}
+    finally:
+        await store.close()
+
+
+def test_leave_drops_the_departing_connections_dedup_state(clock):
+    """Connection ids never recur, so their dedup state is dead once they go.
+
+    Keeping it grew the document forever and charged it to the content budget.
+    """
+    session = Session("s", "owner", _config().limits, clock)
+    owner = FakeConn(member("owner"))
+    session.join(owner)
+    session.handle(
+        owner.connection_id,
+        {
+            "type": "doc-create",
+            "doc": {"id": "main", "title": "t", "kind": "dsl", "text": "", "default": True},
+        },
+    )
+    writer = FakeConn(member("w"))
+    session.join(writer)
+    session.handle(
+        writer.connection_id,
+        {
+            "type": "doc-edit",
+            "docId": "main",
+            "baseRev": 0,
+            "authorSeq": 1,
+            "edit": {"start": 0, "end": 0, "text": "x"},
+        },
+    )
+    doc = session.docs._docs["main"]
+    assert set(doc._author_seq_highwater) == {writer.connection_id}
+
+    session.leave(writer.connection_id)
+
+    assert doc._author_seq_highwater == {}
+    assert doc._retry_cache == {}
+    assert "author_seq_highwater" not in session.freeze_snapshot()["docs"][0]
+
+
+async def test_doc_text_keeps_utf16_offsets_across_freeze_and_thaw(tmp_path, clock):
+    """An astral character must not shift offsets once a doc round-trips the store."""
+    store = await Store.open(str(tmp_path / "utf16.db"))
+    try:
+        hub = Hub(_config(), store, clock)
+        session_id = await hub.create_session(
+            member("owner"),
+            {
+                "docs": [
+                    {
+                        "id": "main",
+                        "title": "Program",
+                        "kind": "dsl",
+                        "text": "\U0001F600ab",
+                        "default": True,
+                    }
+                ]
+            },
+        )
+        owner = FakeConn(member("owner", "alice"))
+        session = await hub.connect(session_id, owner)
+        session.handle(
+            owner.connection_id,
+            {
+                "type": "doc-edit",
+                "docId": "main",
+                "baseRev": 0,
+                "authorSeq": 1,
+                # JS offset 3: between "a" and "b" in "\U0001F600ab" (length 4).
+                "edit": {"start": 3, "end": 3, "text": "X"},
+            },
+        )
+        hub.disconnect(session, owner.connection_id)
+        clock.advance(hub.limits.freeze_grace + 1)
+        await hub.scan()
+
+        rejoined = FakeConn(member("owner", "alice"))
+        session2 = await hub.connect(session_id, rejoined)
+        snapshot = frames(rejoined, "session-snapshot")[-1]
+        # What a browser receives after JSON round-trips the surrogate pair.
+        assert json.loads(json.dumps(snapshot["docs"][0]["text"])) == "\U0001F600aXb"
+
+        rejoined.sent.clear()
+        session2.handle(
+            rejoined.connection_id,
+            {
+                "type": "doc-edit",
+                "docId": "main",
+                "baseRev": 1,
+                "authorSeq": 2,
+                "edit": {"start": 5, "end": 5, "text": "!"},  # append at JS length
+            },
+        )
+        assert frames(rejoined, "doc-reject") == []
+        assert json.loads(json.dumps(session2.docs.snapshot()[0]["text"])) == "\U0001F600aXb!"
     finally:
         await store.close()
 

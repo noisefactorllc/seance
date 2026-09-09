@@ -736,6 +736,37 @@ def test_poly_snapshot_owner_only_and_decorated(clock):
     assert frames(o, "poly-snapshot") == []
 
 
+def test_poly_snapshot_relay_carries_the_servers_node_versions(clock):
+    """Peers must see canonical versions, not whatever the owner's client sent.
+
+    A peer that derives its next ``base_rev`` from a relayed version would be
+    rejected as stale (or worse, accepted against the wrong node).
+    """
+    s = Session("s", "owner", Limits(), clock)
+    o = FakeConn(member("owner"))
+    b = FakeConn(member("b"))
+    s.join(o)
+    s.join(b)
+    b.sent.clear()
+
+    s.handle(
+        o.connection_id,
+        {
+            "type": "poly-snapshot",
+            "programText": "p",
+            "nodes": [
+                {"id": "n", "kind": "k", "text": "", "version": 41},  # stale client value
+                {"id": "m", "kind": "k", "text": ""},  # no version at all
+            ],
+        },
+    )
+
+    relayed = frames(b, "poly-snapshot")[0]
+    assert relayed["rev"] == s.poly.rev == 1
+    assert relayed["nodes"] == s.poly.snapshot()["nodes"]
+    assert {node["version"] for node in relayed["nodes"]} == {1}
+
+
 def test_poly_upsert_rejects_aggregate_session_budget_without_advancing_rev(clock):
     s = Session("s", "owner", Limits(max_session_bytes=180), clock)
     o = FakeConn(member("owner"))

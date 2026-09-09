@@ -1,6 +1,7 @@
 """Tests for the pure text document engine in app.textdoc."""
 
 import dataclasses
+import json
 
 import pytest
 
@@ -223,6 +224,94 @@ def test_apply_edit_rejects_empty_edit():
             author_seq=1,
         )
     assert exc.value.reason == "invalid"
+
+
+def test_apply_edit_uses_utf16_offsets_for_an_astral_character():
+    """Clients count UTF-16 code units (JS string indexing); the server must agree.
+
+    In JS ``"\U0001F600ab"`` has length 4, so an insert between "a" and "b" is
+    offset 3 and an append is offset 4. Under Python code-point indexing those
+    would land one place early and out of bounds respectively.
+    """
+    docs = _collection()
+    docs.create_doc("main", "Program", "dsl", "\U0001F600ab", default=True)
+
+    accepted = docs.apply_edit(
+        "main",
+        base_rev=0,
+        edit=TextEdit(3, 3, "X"),
+        author_id="u1",
+        connection_id="c1",
+        author_seq=1,
+    )
+
+    assert accepted.edit == TextEdit(3, 3, "X")
+    # The wire form is what a browser sees: json escapes the surrogate pair and
+    # JSON.parse reassembles it.
+    assert json.loads(json.dumps(_doc_snapshot(docs, "main")["text"])) == "\U0001F600aXb"
+
+
+def test_apply_edit_appends_at_the_utf16_length_of_an_astral_document():
+    docs = _collection()
+    docs.create_doc("main", "Program", "dsl", "\U0001F600ab", default=True)
+
+    docs.apply_edit(
+        "main",
+        base_rev=0,
+        edit=TextEdit(4, 4, "X"),  # JS "\U0001F600ab".length
+        author_id="u1",
+        connection_id="c1",
+        author_seq=1,
+    )
+
+    assert json.loads(json.dumps(_doc_snapshot(docs, "main")["text"])) == "\U0001F600abX"
+
+
+def test_apply_edit_rejects_an_offset_past_the_utf16_length():
+    docs = _collection()
+    docs.create_doc("main", "Program", "dsl", "\U0001F600ab", default=True)
+
+    with pytest.raises(TextDocReject) as exc:
+        docs.apply_edit(
+            "main",
+            base_rev=0,
+            edit=TextEdit(5, 5, "X"),
+            author_id="u1",
+            connection_id="c1",
+            author_seq=1,
+        )
+    assert exc.value.reason == "invalid"
+
+
+def test_forget_connection_drops_only_that_connection_dedup_state():
+    docs = _collection()
+    docs.create_doc("main", "Program", "dsl", "abc", default=True)
+    doc = docs._docs["main"]
+    for connection_id in ("c1", "c2"):
+        docs.apply_edit(
+            "main",
+            base_rev=doc.rev,
+            edit=TextEdit(0, 0, "x"),
+            author_id="u1",
+            connection_id=connection_id,
+            author_seq=1,
+        )
+    assert set(doc._author_seq_highwater) == {"c1", "c2"}
+
+    doc.forget_connection("c1")
+
+    assert set(doc._author_seq_highwater) == {"c2"}
+    assert [key for key, _ in doc._retry_cache] == ["c2"]
+    # A connection id never recurs, so the dropped state can never dedup again.
+    replay = docs.apply_edit(
+        "main",
+        base_rev=doc.rev,
+        edit=TextEdit(0, 0, "y"),
+        author_id="u1",
+        connection_id="c1",
+        author_seq=1,
+    )
+    assert replay.rev == doc.rev
 
 
 def test_apply_edit_rejects_out_of_range_edit():

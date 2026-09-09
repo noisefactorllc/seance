@@ -307,6 +307,33 @@ async def test_create_session_invalid_json(app_factory):
     assert (await r.json())["error"] == "invalid json"
 
 
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+async def test_create_session_rejects_non_finite_json_in_body(literal, app_factory):
+    """The create body seeds session content, so it takes the frame rules too."""
+    ctx = await app_factory()
+    r = await ctx.client.post(
+        "/v1/sessions",
+        headers={"Origin": ALLOWED, "Content-Type": "application/json"},
+        data='{"snapshot":{"state":[{"id":"k","value":' + literal + "}]}}",
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "invalid json"
+    assert await ctx.store.count_sessions() == 0
+
+
+async def test_create_session_rejects_deeply_nested_body(app_factory):
+    ctx = await app_factory()
+    frame = "[" * 600 + "]" * 600
+    r = await ctx.client.post(
+        "/v1/sessions",
+        headers={"Origin": ALLOWED, "Content-Type": "application/json"},
+        data='{"snapshot":{"poly":{"programText":"","nodes":[],"frame":' + frame + "}}}",
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "invalid json"
+    assert await ctx.store.count_sessions() == 0
+
+
 async def test_create_session_non_object_json_rejected(app_factory):
     # Well-formed JSON that is not an object is a distinct, more specific 400 than
     # a parse failure — the body slot must be a snapshot-bearing object.
