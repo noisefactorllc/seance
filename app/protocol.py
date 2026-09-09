@@ -99,6 +99,12 @@ ENVELOPE_KEYS = frozenset(
 )
 
 # Protocol-literal field caps (not config-tunable; per the message table).
+# Integers above 2**53-1 are not representable by JSON.parse in browsers; the
+# server echoes client integers (base_rev, author_seq) back, so refuse them.
+MAX_SAFE_INT = 2**53 - 1
+# Nesting deeper than this survives json.loads but not copy.deepcopy (which the
+# session uses for transactional lane commits); refuse it at the frame edge.
+MAX_FRAME_DEPTH = 64
 _NODE_ID_MAX = 200
 _KIND_MAX = 32
 _ROLE_MAX = 64
@@ -150,6 +156,8 @@ def _int_field(msg: dict, field: str, *, minimum: int | None, required: bool) ->
     if not isinstance(value, int) or isinstance(value, bool):
         raise ProtocolError(ErrorCode.bad_frame, f"{field} must be an integer", ref_type=field)
     if minimum is not None and value < minimum:
+        raise ProtocolError(ErrorCode.bad_frame, f"{field} is out of range", ref_type=field)
+    if value > MAX_SAFE_INT or value < -MAX_SAFE_INT:
         raise ProtocolError(ErrorCode.bad_frame, f"{field} is out of range", ref_type=field)
     return value
 
@@ -490,9 +498,13 @@ def _validate_text_edit(msg: dict, limits: Limits) -> dict:
     edit = msg.get("edit")
     if not isinstance(edit, dict):
         raise ProtocolError(ErrorCode.bad_frame, "edit must be an object", ref_type="edit")
+    start = _int_field(edit, "start", minimum=0, required=True)
+    end = _int_field(edit, "end", minimum=0, required=True)
+    if end < start:
+        raise ProtocolError(ErrorCode.bad_frame, "edit end must be >= start", ref_type="edit")
     return {
-        "start": _int_field(edit, "start", minimum=0, required=True),
-        "end": _int_field(edit, "end", minimum=0, required=True),
+        "start": start,
+        "end": end,
         "text": _str_field(edit, "text", max_len=limits.max_doc_edit_text, required=True),
     }
 
@@ -654,21 +666,51 @@ SNAPSHOT_LANE = frozenset({"state-set", "poly-snapshot", "doc-create", "doc-rese
 # --------------------------------------------------------------------------- #
 
 
+def _reject_constant(name: str):
+    # Python's json accepts the non-standard NaN / Infinity / -Infinity literals
+    # and would re-emit them on fan-out and persistence, where JSON.parse in every
+    # browser client throws. Treat them as malformed JSON.
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
+def _nesting_depth_exceeds(obj, limit: int) -> bool:
+    """Iteratively check container nesting depth (no recursion, no stack risk)."""
+    stack = [(obj, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if depth > limit:
+            return True
+        for child in children:
+            if isinstance(child, (dict, list)):
+                stack.append((child, depth + 1))
+    return False
+
+
 def parse_frame(raw: str, *, max_len: int) -> dict:
     """Parse one text frame into a JSON object.
 
     Raises :class:`ProtocolError` with ``too_large`` when the UTF-8 byte length
     exceeds ``max_len`` (checked before parsing), or ``bad_frame`` when the
-    payload is not valid JSON or is not a JSON object.
+    payload is not valid JSON (including the non-standard ``NaN`` / ``Infinity``
+    literals), is not a JSON object, or nests deeper than
+    :data:`MAX_FRAME_DEPTH`.
     """
     if len(raw.encode("utf-8")) > max_len:
         raise ProtocolError(ErrorCode.too_large, "frame exceeds maximum size")
     try:
-        obj = json.loads(raw)
-    except ValueError as exc:
+        obj = json.loads(raw, parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as exc:
         raise ProtocolError(ErrorCode.bad_frame, "frame is not valid JSON") from exc
     if not isinstance(obj, dict):
         raise ProtocolError(ErrorCode.bad_frame, "frame must be a JSON object")
+    if _nesting_depth_exceeds(obj, MAX_FRAME_DEPTH):
+        raise ProtocolError(ErrorCode.bad_frame, "frame nests too deeply")
     return obj
 
 
@@ -682,6 +724,10 @@ def validate_message(msg: dict, limits: Limits) -> dict:
     """
     if not isinstance(msg, dict):
         raise ProtocolError(ErrorCode.bad_frame, "frame must be a JSON object")
+    # parse_frame already enforces this for WebSocket frames; repeating it here
+    # covers every other producer of a message dict (tests, future transports).
+    if _nesting_depth_exceeds(msg, MAX_FRAME_DEPTH):
+        raise ProtocolError(ErrorCode.bad_frame, "frame nests too deeply")
     msg_type = msg.get("type")
     if not isinstance(msg_type, str):
         raise ProtocolError(ErrorCode.bad_frame, "missing or invalid type", ref_type="type")
