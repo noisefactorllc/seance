@@ -260,7 +260,7 @@ def test_existing_node_upsert_text_limit_leaves_node_unchanged():
     assert doc.nodes["root.0"].text == "ok"
 
 
-def test_existing_node_upsert_ignores_parent_and_updates_in_place():
+def test_existing_node_upsert_to_missing_parent_is_orphan_rejected():
     doc = _doc()
     doc.apply_snapshot(
         "p",
@@ -270,15 +270,37 @@ def test_existing_node_upsert_ignores_parent_and_updates_in_place():
         ],
         None,
     )  # rev 1
-    # parent points at a non-existent node, but for an EXISTING node it is ignored
+    # parent points at a non-existent node: the orphan rule applies to re-parenting too
     r = doc.upsert(
         base_rev=1, node_id="root.0", kind="s2", text="b",
         parent_id="ghost", author="a", author_seq=None,
     )
+    assert r.status == "rejected"
+    assert r.reason == "orphan"
+    assert doc.rev == 1
+    assert doc.nodes["root.0"].kind == "s"
+    assert doc.nodes["root.0"].parent_id == "root"
+
+
+def test_existing_node_upsert_to_present_parent_updates_in_place():
+    doc = _doc()
+    doc.apply_snapshot(
+        "p",
+        [
+            {"id": "root", "kind": "grp", "text": ""},
+            {"id": "other", "kind": "grp", "text": ""},
+            {"id": "root.0", "kind": "s", "text": "a", "parentId": "root"},
+        ],
+        None,
+    )  # rev 1
+    r = doc.upsert(
+        base_rev=1, node_id="root.0", kind="s2", text="b",
+        parent_id="other", author="a", author_seq=None,
+    )
     assert r.status == "applied"
     assert doc.nodes["root.0"].kind == "s2"
     assert doc.nodes["root.0"].text == "b"
-    assert doc.nodes["root.0"].parent_id == "ghost"  # updated when provided non-None
+    assert doc.nodes["root.0"].parent_id == "other"  # updated when provided non-None
 
 
 def test_existing_node_upsert_keeps_parent_when_none():

@@ -273,6 +273,10 @@ class PolyDoc:
                 return ApplyResult(status="rejected", rev=self.rev, applied=[], reason="limit")
             new_parent = parent_id
         else:
+            # Re-parenting follows the same orphan rule as creation: a named
+            # parent must exist (and a node cannot be its own parent).
+            if parent_id is not None and (parent_id == node_id or parent_id not in self.nodes):
+                return ApplyResult(status="rejected", rev=self.rev, applied=[], reason="orphan")
             if len(text) > self._limits.max_node_text:
                 return ApplyResult(status="rejected", rev=self.rev, applied=[], reason="limit")
             new_parent = parent_id if parent_id is not None else existing.parent_id
