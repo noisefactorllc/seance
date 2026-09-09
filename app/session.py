@@ -41,7 +41,7 @@ from app.engine import DataLane, EngineLimit, PolyDoc, StateLane
 from app.identity import Identity, Kind
 from app.moderation import handle_mod
 from app.protocol import ErrorCode, ProtocolError
-from app.textdoc import TextDocCollection, TextDocReject, TextEdit, _OpLogEntry
+from app.textdoc import TextDocCollection, TextDocReject, TextEdit, _OpLogEntry, to_utf16_units
 
 _GUEST_KINDS = (Kind.ANON, Kind.GS_EPHEMERAL)
 
@@ -1204,14 +1204,21 @@ class Session:
             )
             doc = session.docs._docs[frozen["id"]]
             doc._rev = frozen["rev"]
-            doc._text = frozen["text"]
+            # The store round-trips through json, which recombines escaped
+            # surrogate pairs into code points; re-split into UTF-16 units.
+            doc._text = to_utf16_units(frozen["text"])
             doc._oplog = []
             doc._oplog_bytes = 0
             for entry in frozen.get("oplog", []):
+                stored_edit = entry["edit"]
                 oplog_entry = _OpLogEntry(
                     rev=entry["rev"],
-                    edit=TextEdit(**entry["edit"]),
-                    prior_text=entry["prior_text"],
+                    edit=TextEdit(
+                        stored_edit["start"],
+                        stored_edit["end"],
+                        to_utf16_units(stored_edit["text"]),
+                    ),
+                    prior_text=to_utf16_units(entry["prior_text"]),
                     size=protocol.json_size(
                         {
                             "rev": entry["rev"],

@@ -3,13 +3,39 @@
 from __future__ import annotations
 
 import json
+import sys
+from array import array
 from dataclasses import dataclass
 
 from app.config import Limits
 
+_UTF16 = "utf-16-le" if sys.byteorder == "little" else "utf-16-be"
+
 
 def _json_size(value: object) -> int:
     return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+
+
+def to_utf16_units(text: str) -> str:
+    """Re-express ``text`` with exactly one Python character per UTF-16 code unit.
+
+    Every client is a browser whose offsets (``diffText``, ``selectionStart``)
+    count UTF-16 code units, while Python ``str`` indexing counts code points, so
+    any astral character (emoji, supplementary CJK, ...) shifts every following
+    offset by one and the server silently diverges from its peers. Storing the
+    document as UTF-16 units makes ``len`` and slicing agree with the client
+    exactly, including edits that split a surrogate pair.
+
+    On the way out nothing needs converting: ``json.dumps`` with the default
+    ``ensure_ascii`` (used by the transport and the store) escapes each surrogate
+    unit as a ``\\u`` JSON escape and ``JSON.parse`` reassembles the pairs. On the way in
+    ``json.loads`` recombines escaped pairs into code points, so every text that
+    enters a document (create, reset, edit text, thaw) passes through here.
+    """
+    if text.isascii():
+        return text
+    units = array("H", text.encode(_UTF16, "surrogatepass"))
+    return "".join(map(chr, units))
 
 
 def _is_int(value: object) -> bool:
@@ -87,13 +113,14 @@ class TextDoc:
         self._kind = kind
         self._default = default
         self._rev = 0
-        self._text = text
         self._oplog: list[_OpLogEntry] = []
         self._oplog_bytes = 0
         self._retry_cache: dict[tuple[str, int], AcceptedTextEdit | TextDocReject] = {}
         self._author_seq_highwater: dict[str, int] = {}
         self._validate_doc_meta()
+        text = self._coerce_text(text)
         self._validate_doc_text(text)
+        self._text = text
 
     @property
     def rev(self) -> int:
@@ -163,7 +190,7 @@ class TextDoc:
         author_seq: int | None,
     ) -> AcceptedTextEdit:
         self._validate_base_rev(base_rev)
-        self._validate_edit_payload(edit)
+        edit = self._normalize_edit(edit)
         base_text, transforms = self._resolve_base(base_rev)
         self._validate_range(base_text, edit)
 
@@ -205,6 +232,7 @@ class TextDoc:
         return accepted
 
     def reset(self, text: str) -> dict:
+        text = self._coerce_text(text)
         self._validate_doc_text(text)
         self._rev += 1
         self._text = text
@@ -222,6 +250,11 @@ class TextDoc:
         if not isinstance(self._kind, str):
             raise TextDocReject("invalid", "doc kind must be a string")
 
+    def _coerce_text(self, text: object) -> str:
+        if not isinstance(text, str):
+            raise TextDocReject("invalid", "doc text must be a string")
+        return to_utf16_units(text)
+
     def _validate_doc_text(self, text: str) -> None:
         if not isinstance(text, str):
             raise TextDocReject("invalid", "doc text must be a string")
@@ -232,15 +265,18 @@ class TextDoc:
         if not _is_int(base_rev) or base_rev < 0 or base_rev > self._rev:
             raise TextDocReject("stale", "base revision is not current")
 
-    def _validate_edit_payload(self, edit: TextEdit) -> None:
+    def _normalize_edit(self, edit: TextEdit) -> TextEdit:
+        """Validate the edit payload and return it with ``text`` in UTF-16 units."""
         if not isinstance(edit.text, str):
             raise TextDocReject("invalid", "edit text must be a string")
-        if len(edit.text) > self._limits.max_doc_edit_text:
+        text = to_utf16_units(edit.text)
+        if len(text) > self._limits.max_doc_edit_text:
             raise TextDocLimit(
                 f"edit text too large ({self._limits.max_doc_edit_text} chars)"
             )
-        if edit.start == edit.end and edit.text == "":
+        if edit.start == edit.end and text == "":
             raise TextDocReject("invalid", "empty edit is not allowed")
+        return TextEdit(edit.start, edit.end, text)
 
     def _resolve_base(self, base_rev: int) -> tuple[str, list[_OpLogEntry]]:
         if base_rev == self._rev:
