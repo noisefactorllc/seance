@@ -62,6 +62,9 @@ _TEARDOWN_TIMEOUT = 5.0
 _RATE_ERROR_THROTTLE = 1.0
 _CLOSE_HEARTBEAT = 1011  # RFC 6455 "internal error / going away" for a dead peer
 _MAX_CLOSE_REASON = 123  # RFC 6455 control-frame payload ceiling
+_SNAPSHOT_OUTPUT_TYPES = frozenset(
+    {"session-snapshot", "doc-snapshot", "doc-reject", "poly-snapshot", "state-set"}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -72,13 +75,16 @@ _MAX_CLOSE_REASON = 123  # RFC 6455 control-frame payload ceiling
 class _Frame:
     """A serialized outbound frame retained with the metadata shedding needs."""
 
-    __slots__ = ("mtype", "nbytes", "text", "user_id")
+    __slots__ = ("mtype", "nbytes", "snapshot_budget", "text", "user_id")
 
-    def __init__(self, text: str, nbytes: int, mtype: str | None, user_id: str) -> None:
+    def __init__(
+        self, text: str, nbytes: int, mtype: str | None, user_id: str, snapshot_budget: bool
+    ) -> None:
         self.text = text
         self.nbytes = nbytes
         self.mtype = mtype
         self.user_id = user_id
+        self.snapshot_budget = snapshot_budget
 
 
 class _CloseSentinel:
@@ -102,10 +108,12 @@ class WsConn:
     ``send_json`` is synchronous and never blocks the caller (the Session runs it
     inline during fan-out): it serializes the frame once and appends it to a
     :class:`collections.deque` bounded by ``send_queue_frames`` and
-    ``send_queue_bytes``. A single :meth:`run_writer` task drains the buffer with
+    ``send_queue_bytes``, with one separately bounded snapshot reservation. A
+    single :meth:`run_writer` task drains the buffer with
     ``ws.send_str``. On overflow the queue first sheds superseded cursor frames
     — keeping only the newest per originator and cursor type — and, if still
-    over either budget, schedules a ``4408`` close and refuses the frame.
+    over budget after the snapshot allowance, schedules a ``4408`` close and
+    refuses the frame.
     """
 
     def __init__(
@@ -122,6 +130,11 @@ class WsConn:
         self._clock = clock
         self._max_frames = limits.send_queue_frames
         self._max_bytes = limits.send_queue_bytes
+        # Full state can exceed the delta queue cap. Permit exactly one extra
+        # snapshot, including while the writer awaits its send. Its own bound is
+        # the aggregate content cap plus one ordinary frame for envelope fields.
+        self._max_snapshot_bytes = limits.max_session_bytes + limits.max_frame
+        self._snapshot_pending = False
         self._buffer: deque[_Frame | _CloseSentinel] = deque()
         self._event = asyncio.Event()
         self._queued_bytes = 0
@@ -168,13 +181,26 @@ class WsConn:
             self.pending_anon_token = None
         text = json.dumps(msg, separators=(",", ":"))
         nbytes = len(text.encode("utf-8"))
+        snapshot_budget = False
         if self._would_overflow(nbytes):
             self._compact_cursors()
             if self._would_overflow(nbytes):
-                self.close_soon(protocol.CLOSE_SLOW, "slow consumer")
-                return False
-        self._buffer.append(_Frame(text, nbytes, msg.get("type"), msg.get("user_id", "")))
-        self._queued_bytes += nbytes
+                snapshot_budget = (
+                    msg.get("type") in _SNAPSHOT_OUTPUT_TYPES
+                    and not self._snapshot_pending
+                    and nbytes <= self._max_snapshot_bytes
+                    and len(self._buffer) + 1 <= self._max_frames
+                )
+                if not snapshot_budget:
+                    self.close_soon(protocol.CLOSE_SLOW, "slow consumer")
+                    return False
+        self._buffer.append(
+            _Frame(text, nbytes, msg.get("type"), msg.get("user_id", ""), snapshot_budget)
+        )
+        if snapshot_budget:
+            self._snapshot_pending = True
+        else:
+            self._queued_bytes += nbytes
         self._event.set()
         return True
 
@@ -204,12 +230,16 @@ class WsConn:
                 if isinstance(item, _CloseSentinel):
                     await self._close_ws(item.code, item.reason)
                     return
-                self._queued_bytes -= item.nbytes
+                if not item.snapshot_budget:
+                    self._queued_bytes -= item.nbytes
                 try:
                     await self._ws.send_str(item.text)
                 except Exception:
                     self._closing = True
                     return
+                finally:
+                    if item.snapshot_budget:
+                        self._snapshot_pending = False
             if self._stopped:
                 return
 
@@ -493,6 +523,8 @@ async def _run_read_loop(
         try:
             parsed = protocol.parse_frame(raw, max_len=limits.max_snapshot_frame)
             mtype = parsed.get("type")
+            if not isinstance(mtype, str):
+                raise ProtocolError(ErrorCode.bad_frame, "missing or invalid type", ref_type="type")
             if mtype not in protocol.SNAPSHOT_LANE and len(raw.encode("utf-8")) > limits.max_frame:
                 raise ProtocolError(ErrorCode.too_large, "frame exceeds maximum size")
         except ProtocolError as exc:

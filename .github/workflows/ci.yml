@@ -40,5 +40,5 @@ jobs:
       - name: Run ruff
         run: python -m ruff check .
 
-      - name: Run SDK tests
-        run: npm run test:sdk
+      - name: Run SDK unit, live-server, and performance tests
+        run: python scripts/test-sdk-ci.py

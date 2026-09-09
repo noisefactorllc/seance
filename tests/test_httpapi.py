@@ -322,6 +322,25 @@ async def test_create_session_anon_returns_token(app_factory):
     assert r.headers["Set-Cookie"].startswith("SEANCE_ANON=")
 
 
+async def test_explicit_anon_header_controls_identity_when_cookie_differs(app_factory):
+    ctx = await app_factory()
+    header_identity, header_token = ctx.identity.mint_anon()
+    _, cookie_token = ctx.identity.mint_anon()
+    headers = {"Origin": ALLOWED, "X-Seance-Anon": header_token}
+    cookies = {"SEANCE_ANON": cookie_token}
+
+    response = await ctx.client.get("/v1/me", headers=headers, cookies=cookies)
+    assert response.status == 200
+    assert (await response.json())["user_id"] == header_identity.user_id
+
+    response = await ctx.client.post("/v1/sessions", headers=headers, cookies=cookies)
+    assert response.status == 201
+    body = await response.json()
+    assert "anon_token" not in body  # The valid explicit identity is reused.
+    session = await ctx.store.load_session(body["session_id"])
+    assert session["created_by"] == header_identity.user_id
+
+
 async def test_create_session_anon_is_rate_limited_per_ip_without_cookies(app_factory):
     """Fresh identities must not bypass the source-IP creation budget."""
     ctx = await app_factory(SEANCE_LIMIT_CREATES_PER_IP_HOUR="2")
@@ -582,3 +601,15 @@ async def test_unhandled_error_log_uses_route_template_not_session_id(app_factor
     assert len(records) == 1
     assert records[0].getMessage() == "unhandled error serving GET /v1/sessions/{id}"
     assert raw_session_id not in records[0].getMessage()
+
+
+@pytest.mark.parametrize("number", ["1e999", "-1e999", "1.8e308"])
+async def test_create_rejects_overflowing_json_numbers_before_persistence(app_factory, number):
+    ctx = await app_factory()
+    response = await ctx.client.post(
+        "/v1/sessions",
+        headers={"Origin": ALLOWED, "Content-Type": "application/json"},
+        data='{"snapshot":{"state":[{"id":"x","value":' + number + '}]}}',
+    )
+    assert response.status == 400
+    assert await ctx.store.count_sessions() == 0

@@ -229,6 +229,48 @@ async def test_anon_token_reconnect_is_stable_identity(harness):
     assert welcome2["you"]["user_id"] == uid
 
 
+async def test_valid_session_larger_than_delta_queue_can_join_and_resync(harness):
+    ctx = await harness.server()
+    state = [{"id": f"k{i}", "value": "x" * 7000} for i in range(200)]
+    sid = await ctx.hub.create_session(_member(), {"state": state})
+    ws = await harness.ws(ctx, sid)
+    await _welcome(ws)
+    snapshot = await _recv_type(ws, "session-snapshot")
+    assert len(snapshot["state"]) == 200
+    assert len(json.dumps(snapshot)) > ctx.config.limits.send_queue_bytes
+    await ws.send_json({"type": "session-state"})
+    resync = await _recv_type(ws, "session-snapshot")
+    assert resync["state"] == snapshot["state"]
+
+
+async def test_overflowing_json_number_cannot_poison_later_join(harness):
+    ctx = await harness.server()
+    sid = await ctx.hub.create_session(_member())
+    attacker = await harness.ws(ctx, sid)
+    await _welcome(attacker)
+    await _recv_type(attacker, "session-snapshot")
+    await attacker.send_str('{"type":"state-update","id":"x","value":1e999}')
+    assert (await _recv_type(attacker, "error"))["code"] == "bad_frame"
+    joiner = await harness.ws(ctx, sid)
+    await _welcome(joiner)
+    assert (await _recv_type(joiner, "session-snapshot"))["state"] == []
+
+
+@pytest.mark.parametrize("bad_type", [[], {}])
+async def test_nonstring_frame_type_is_a_protocol_error_and_connection_remains_usable(
+    harness, bad_type
+):
+    ctx = await harness.server()
+    sid = await ctx.hub.create_session(_member())
+    ws = await harness.ws(ctx, sid)
+    await _welcome(ws)
+    await _recv_type(ws, "session-snapshot")
+    await ws.send_json({"type": bad_type})
+    assert (await _recv_type(ws, "error"))["code"] == "bad_frame"
+    await ws.send_json({"type": "ping"})
+    assert (await _recv_type(ws, "pong"))["type"] == "pong"
+
+
 # --------------------------------------------------------------------------- #
 # Convergence / fan-out
 # --------------------------------------------------------------------------- #
@@ -557,6 +599,57 @@ async def test_wsconn_welcome_anon_token_injected_exactly_once(clock):
     assert frames[0]["anon_token"] == "TICKET-TOKEN"
     assert "anon_token" not in frames[1]
     assert conn.pending_anon_token is None
+
+
+@pytest.mark.parametrize("mtype", ["session-snapshot", "doc-snapshot", "doc-reject"])
+async def test_wsconn_allows_only_one_large_snapshot_with_a_bounded_size(clock, mtype):
+    limits = Limits()
+    conn = WsConn(SimpleNamespace(closed=False), _anon(), "c1", limits, clock)
+    # Use the exact default upper bound: session content plus envelope allowance.
+    cap = limits.max_session_bytes + limits.max_frame
+    overhead = len(json.dumps({"type": mtype, "text": ""}, separators=(",", ":")))
+    frame = {"type": mtype, "text": "x" * (cap - overhead)}
+    assert conn.send_json(frame) is True
+    assert conn.send_json({"type": "pong"}) is True
+    assert conn.send_json(frame) is False
+    assert conn.close_info == (4408, "slow consumer")
+    assert len(conn.queued_frames()) == 2
+
+    too_big = WsConn(SimpleNamespace(closed=False), _anon(), "c2", limits, clock)
+    assert too_big.send_json({"type": mtype, "text": frame["text"] + "x"}) is False
+    assert too_big.close_info == (4408, "slow consumer")
+
+
+async def test_wsconn_snapshot_reservation_does_not_expand_delta_budget(clock):
+    limits = Limits(send_queue_bytes=100)
+    conn = WsConn(SimpleNamespace(closed=False), _anon(), "c1", limits, clock)
+    assert conn.send_json({"type": "session-snapshot", "state": "x" * 200}) is True
+    assert conn.send_json({"type": "state-update", "value": "x" * 100}) is False
+    assert conn.close_info == (4408, "slow consumer")
+
+
+async def test_wsconn_keeps_large_snapshot_reservation_until_send_finishes(clock):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_send(text):
+        entered.set()
+        await release.wait()
+
+    socket = SimpleNamespace(closed=True, send_str=blocked_send)
+    conn = WsConn(socket, _anon(), "c1", Limits(send_queue_bytes=100), clock)
+    frame = {"type": "session-snapshot", "state": "x" * 200}
+    assert conn.send_json(frame) is True
+    writer = asyncio.create_task(conn.run_writer())
+    try:
+        async with asyncio.timeout(2):
+            await entered.wait()
+            assert conn.send_json(frame) is False
+            assert conn.close_info == (4408, "slow consumer")
+    finally:
+        release.set()
+        conn.request_stop()
+        await writer
 
 
 async def test_wsconn_sheds_cursors_then_closes_slow_consumer(clock):

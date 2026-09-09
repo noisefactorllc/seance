@@ -500,12 +500,17 @@ class Session:
         # keys. The creator and an explicitly transferred owner may always
         # re-enter (a reload or a thaw would otherwise seal the session forever,
         # since the lock is persisted and no other unlock path exists).
-        if self.settings.locked and identity.user_id not in (
+        holds_access = identity.user_id in (
             self.created_by,
             self.settings.explicit_owner,
-        ):
+        )
+        if self.settings.locked and not holds_access:
             raise JoinRefused(protocol.CLOSE_LOCKED, "locked")
-        if not self.settings.guests_allowed and identity.kind in _GUEST_KINDS:
+        if (
+            not self.settings.guests_allowed
+            and identity.kind in _GUEST_KINDS
+            and not holds_access
+        ):
             raise JoinRefused(protocol.CLOSE_FORBIDDEN, "guests not allowed")
         declared = conn.declared_dialects or [protocol.DEFAULT_DIALECT]
         if self.dialect not in declared:

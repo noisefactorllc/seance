@@ -361,9 +361,13 @@ async def _migrate_v3_to_v4(db: aiosqlite.Connection) -> None:
     async with db.execute("PRAGMA table_info(sessions)") as cursor:
         columns = {row[1] for row in await cursor.fetchall()}
     if "first_joined_at" not in columns:
-        # NULL for every existing row: a session already in the store predates
-        # the marker, so it is treated as claimed and keeps the long retention.
         await db.execute("ALTER TABLE sessions ADD COLUMN first_joined_at INTEGER")
+    # Older schemas never recorded the first join. Reserve zero for that unknown
+    # history so existing content retains the long TTL. NULL means demonstrably
+    # never joined, and is assigned only to sessions created with the new schema.
+    await db.execute(
+        "UPDATE sessions SET first_joined_at = 0 WHERE first_joined_at IS NULL"
+    )
 
 
 async def _migrate_v2_to_v3(db: aiosqlite.Connection) -> None:

@@ -686,7 +686,7 @@ test('joining a new session closes the prior socket and ignores its delayed clos
     assert.equal(FakeWebSocket.instances[0].closed, true)
     await finishHandshake(second, FakeWebSocket.instances[1], [
         { id: 'main', title: 'Program', kind: 'dsl', rev: 0, text: 'second()', default: true },
-    ], { type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'], resume: { last_seq: 2 } })
+    ], { type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'] })
 
     FakeWebSocket.instances[0].emit('close', {})
     assert.equal(layer.getStatus(), 'online')
@@ -702,7 +702,7 @@ test('joining a new session closes the prior socket and ignores its delayed clos
     assert.equal(layer.docs.get('main').text, 'second()')
 })
 
-test('socket interruption reconnects, adopts recovery snapshot, and resubmits local text', async () => {
+test('socket interruption resubmits local text when the recovery snapshot matches its unapplied base', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
         seanceUrl: 'https://seance.test',
@@ -733,16 +733,16 @@ test('socket interruption reconnects, adopts recovery snapshot, and resubmits lo
     await finishHandshake(
         Promise.resolve(),
         reconnectSocket,
-        [{ id: 'main', title: 'Program', kind: 'dsl', rev: 2, text: 'abYc', default: true }],
+        [{ id: 'main', title: 'Program', kind: 'dsl', rev: 0, text: 'abc', default: true }],
         { type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'], resume: { last_seq: 2 } },
     )
     await tick()
 
     const edits = reconnectSocket.sent.filter((msg) => msg.type === 'doc-edit')
     assert.equal(edits.length, 1)
-    assert.equal(edits[0].baseRev, 2)
-    assert.deepEqual(edits[0].edit, { start: 3, end: 3, text: 'X' })
-    assert.equal(editor.value, 'abYXc')
+    assert.equal(edits[0].baseRev, 0)
+    assert.deepEqual(edits[0].edit, { start: 2, end: 2, text: 'X' })
+    assert.equal(editor.value, 'abXc')
     assert.equal(layer.getStatus(), 'online')
 })
 
@@ -1261,6 +1261,10 @@ test('rapid upserts are paced with the configured minimum spacing between sends'
     let sent = FakeWebSocket.instances[0].sent.filter((msg) => msg.type === 'poly-token-upsert')
     assert.equal(sent.length, 1)
     assert.equal(sent[0].id, 'a')
+    FakeWebSocket.instances[0].receive({
+        type: 'poly-ack', author_seq: sent[0].author_seq, rev: 1,
+        applied: [{ id: 'a', version: 1 }],
+    })
 
     await new Promise((resolve) => setTimeout(resolve, 40))
     sent = FakeWebSocket.instances[0].sent.filter((msg) => msg.type === 'poly-token-upsert')

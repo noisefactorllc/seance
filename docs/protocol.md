@@ -50,6 +50,12 @@ precedence order (`app/identity.py` `resolve`):
 4. otherwise a fresh anonymous identity is minted and returned in the first
    `welcome` as `anon_token`.
 
+For HTTP requests, `X-Seance-Anon` takes precedence over the `SEANCE_ANON`
+cookie. Clients that retain a token should send that header when creating a
+session and the same token in `hello`, so another tab's cookie cannot create
+a room under a different anonymous owner. The cookie is `SameSite=Lax` and
+does not supply identity on cross-site app requests.
+
 ### Creating and probing a session
 
 ```
@@ -96,6 +102,9 @@ client                         server
   unknown session, `4429` roster full / the per-user connection cap
   (`max_conns_per_user`, an extra tab of an already-present user) / the global
   connection cap). Identity failure closes `4403` (`unauthorized`).
+- The creator and a persisted explicit owner are exempt from the lock and
+  guests-off join gates. They must still satisfy bans, dialect, and capacity
+  checks, and can return to change the access settings.
 - **Dialect compatibility**: a client declares the dialects it speaks in
   `hello.dialects`; the join is refused `4409` (`dialect_mismatch`) unless the
   session's `dialect` is among them. A client that sends no `dialects` is
@@ -378,6 +387,13 @@ bursts up to the burst ceiling are fine.
   **1 MiB**; this is also the WebSocket `max_msg_size` (a larger single frame
   ends the connection with `1009`).
 - `value` ≤ 8 KiB compact JSON. Per-field string caps are in §3.
+- JSON numbers must decode to finite values; overflowing exponents such as
+  `1e999` are rejected along with `NaN` and `Infinity`.
+- These frame-size limits apply to client input. Server snapshots can contain
+  up to the aggregate session budget. Each connection has one additional
+  snapshot reservation of `max_session_bytes + max_frame` bytes beyond its
+  ordinary send queue. That reservation remains occupied until the send
+  completes; repeated snapshots cannot accumulate outside the queue budget.
 
 ### Heartbeat
 

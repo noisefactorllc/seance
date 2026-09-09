@@ -1,6 +1,7 @@
 """Process entrypoint behavior."""
 
 import logging
+import subprocess
 import sys
 
 import pytest
@@ -103,3 +104,28 @@ def test_run_reports_a_locked_database_as_a_startup_error(monkeypatch, tmp_path,
 
     assert exc.value.code == 1
     assert capsys.readouterr().err.strip() == f"seance: database already in use: {db_path}"
+
+
+def test_failed_application_startup_closes_store_and_exits(tmp_path):
+    # aiosqlite owns a non-daemon thread. An exception after opening the store
+    # must release it, or even an already-failed startup never exits.
+    script = """
+import asyncio
+import sys
+from cryptography.fernet import Fernet
+from app.main import create_app
+asyncio.run(create_app({
+    "SEANCE_SECRET": Fernet.generate_key().decode(),
+    "SEANCE_DB": sys.argv[1],
+    "SEANCE_DIRECTORY_DSN": "unsupported:test-directory",
+}))
+"""
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed script and pytest-owned temporary path.
+            [sys.executable, "-c", script, str(tmp_path / "startup.db")],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("failed application startup leaked its SQLite worker and did not exit")
+    assert result.returncode != 0
+    assert "ConfigError" in result.stderr

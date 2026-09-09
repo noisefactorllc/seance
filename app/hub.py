@@ -422,7 +422,9 @@ class Hub:
         payload = session.freeze_snapshot()
         payload["frozen_at"] = None
         await self.store.save_session(session.session_id, payload)
-        self.last_saved_seq[session.session_id] = session.seq
+        # A frame may arrive while SQLite is awaited. Only the captured revision
+        # was persisted; later mutations must remain dirty for the next scan.
+        self.last_saved_seq[session.session_id] = payload["seq"]
         self.last_saved_at[session.session_id] = self.clock()
 
     async def checkpoint(self, session: Session) -> None:

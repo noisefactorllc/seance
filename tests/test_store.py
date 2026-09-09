@@ -507,3 +507,27 @@ def test_audit_event_is_frozen():
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         event.ts = 2  # type: ignore[misc]
+
+
+async def test_v3_migration_preserves_legacy_sessions_from_unclaimed_retention(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    store = await Store.open(str(db_path))
+    payload = _sample_payload()
+    await store.save_session("legacy", payload)
+    await store.close()
+    with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE sessions DROP COLUMN first_joined_at")
+        db.execute("UPDATE meta SET v = '3' WHERE k = 'schema_version'")
+    migrated = await Store.open(str(db_path))
+    try:
+        # Existing sessions have no reliable first-join history. They must keep
+        # the established long retention instead of being classified as abandoned.
+        cutoff = payload["frozen_at"] + 3601
+        assert await migrated.list_unclaimed_older_than(cutoff) == []
+        assert await migrated.load_session("legacy") is not None
+        fresh = _sample_payload()
+        fresh["first_joined_at"] = None
+        await migrated.save_session("fresh", fresh)
+        assert await migrated.list_unclaimed_older_than(cutoff) == ["fresh"]
+    finally:
+        await migrated.close()

@@ -193,16 +193,179 @@ test('RED: live-5 SDK-1 end to end: ack lost on a dropped socket, reconnect snap
     assert.equal(editor.value, 'abXc')
 })
 
-test('live-6 identity note: a new layer without the anon token (page reload) is a different user; the creator loses ownership', { skip }, async () => {
-    const creator = mk()                                     // fresh identity (one anon mint)
+test('live-6 persisted identity preserves creator ownership across a new layer and another create', { skip }, async (t) => {
+    const values = new Map()
+    const anonTokenStorage = {
+        getItem: (key) => values.get(key) ?? null,
+        setItem: (key, value) => values.set(key, value),
+    }
+    const creator = mk({ anonTokenStorage })
+    const guest = mk({ anonTokenStorage: null })
+    const reloaded = mk({ anonTokenStorage: null })
+    t.after(() => { creator.layer.goOffline(); guest.layer.goOffline(); reloaded.layer.goOffline() })
     await creator.layer.takeOnline([DOC('abc')])
     const id = creator.layer.getSessionId()
-    const welcome1 = creator.events.find((e) => e.name === 'status') && creator.layer.user
-    const reloaded = mk()                                    // reload: in-memory anonToken is gone; no cookie reaches a cross-site WS
-    let welcome2 = null
-    reloaded.layer.on('welcome', (w) => { welcome2 = w })
-    await reloaded.layer.joinSession(id)
-    console.log(`live-6 creator user=${welcome1.user_id} reloaded user=${welcome2.you.user_id} reloaded.is_owner=${welcome2.you.is_owner} owner=${welcome2.owner?.user_id}`)
-    creator.layer.goOffline(); reloaded.layer.goOffline()
-    assert.notEqual(welcome1.user_id, welcome2.you.user_id)
+    const userId = creator.layer.user.user_id
+    await guest.layer.joinSession(id)
+    creator.layer.goOffline()
+    // A fresh layer reads the same tab's storage while another user holds the room open.
+    const restored = mk({ anonTokenStorage })
+    t.after(() => restored.layer.goOffline())
+    await restored.layer.joinSession(id)
+    assert.equal(restored.layer.user.user_id, userId)
+    assert.equal(restored.layer.user.is_owner, true)
+    restored.layer.goOffline()
+    await restored.layer.takeOnline([DOC('second room')])
+    assert.equal(restored.layer.user.user_id, userId)
+    assert.equal(restored.layer.user.is_owner, true)
+    // An explicit opt-out still makes a distinct anonymous visitor.
+    await reloaded.layer.joinSession(restored.layer.getSessionId())
+    assert.notEqual(reloaded.layer.user.user_id, userId)
+    assert.equal(reloaded.layer.user.is_owner, false)
+})
+
+test('live identity rotation replaces an invalid persisted token before later joins', { skip }, async (t) => {
+    const owner = mk()
+    t.after(() => owner.layer.goOffline())
+    await owner.layer.takeOnline([DOC('abc')])
+    const values = new Map()
+    const anonTokenStorage = {
+        getItem: (key) => values.get(key) ?? null,
+        setItem: (key, value) => values.set(key, value),
+    }
+    const expired = mk({ anonTokenStorage, anonToken: 'invalid-expired-token' })
+    t.after(() => expired.layer.goOffline())
+    await expired.layer.joinSession(owner.layer.getSessionId())
+    const userId = expired.layer.user.user_id
+    assert.notEqual(expired.layer.anonToken, 'invalid-expired-token')
+    assert.equal([...values.values()][0], expired.layer.anonToken)
+    const next = mk({ anonTokenStorage })
+    t.after(() => next.layer.goOffline())
+    await next.layer.joinSession(owner.layer.getSessionId())
+    assert.equal(next.layer.user.user_id, userId)
+})
+
+test('live a banned persisted identity remains forbidden after layer recreation', { skip }, async (t) => {
+    const owner = mk()
+    const values = new Map()
+    const anonTokenStorage = {
+        getItem: (key) => values.get(key) ?? null,
+        setItem: (key, value) => values.set(key, value),
+    }
+    const visitor = mk({ anonTokenStorage })
+    t.after(() => { owner.layer.goOffline(); visitor.layer.goOffline() })
+    await owner.layer.takeOnline([DOC('abc')])
+    const id = owner.layer.getSessionId()
+    await visitor.layer.joinSession(id)
+    const token = visitor.layer.anonToken
+    owner.layer._send({ type: 'mod-ban', target_user: visitor.layer.user.user_id })
+    await waitFor(() => visitor.layer.getStatus() === 'offline')
+    assert.ok(visitor.layer.anonToken === token)
+    const next = mk({ anonTokenStorage })
+    t.after(() => next.layer.goOffline())
+    await assert.rejects(next.layer.joinSession(id),
+        (error) => error.code === 'forbidden' && error.frame?.detail === 'banned')
+    await waitFor(() => next.sockets[0].closeInfo !== null)
+    assert.equal(next.sockets[0].closeInfo.code, 4403)
+    assert.ok(next.layer.anonToken === token)
+    assert.ok([...values.values()][0] === token)
+    await sleep(250)
+    assert.equal(next.sockets.length, 1)
+})
+
+async function waitFor(condition) {
+    const deadline = Date.now() + 5000
+    while (!condition() && Date.now() < deadline) await sleep(10)
+    assert.ok(condition(), 'local integration did not settle before its deadline')
+}
+
+test('live-7 JSON-escaped paste chunks converge below the real transport byte cap', { skip }, async (t) => {
+    const { layer, sockets } = mk()
+    t.after(() => layer.goOffline())
+    await layer.takeOnline([DOC('abc')])
+    const text = `a${'\u0000'.repeat(20000)}bc`
+    layer.updateLocalText('main', text)
+    await waitFor(() => layer.docs.get('main').serverText === text)
+    const server = await serverDocs(layer.getSessionId(), layer.anonToken)
+    assert.equal(server.docs[0].text, text)
+    const frames = sockets[0].sentFrames.filter((frame) => frame.type === 'doc-edit')
+    assert.ok(frames.length > 1)
+    assert.ok(frames.every((frame) => Buffer.byteLength(JSON.stringify(frame)) <= 65536))
+})
+
+test('live-8 unanswered node writes recover from a real snapshot and preserve the latest local value', { skip }, async (t) => {
+    class BlackholeNode extends OriginWebSocket {
+        static tripped = false
+        addEventListener(type, handler) {
+            if (type !== 'message') return super.addEventListener(type, handler)
+            return super.addEventListener(type, (event) => { if (!this.blackhole) handler(event) })
+        }
+        send(data) {
+            super.send(data)
+            if (!BlackholeNode.tripped && JSON.parse(data).type === 'poly-token-upsert') {
+                BlackholeNode.tripped = true
+                this.blackhole = true
+            }
+        }
+    }
+    const { layer, sockets } = mk({ Socket: BlackholeNode, inFlightTimeoutMs: 100 })
+    t.after(() => layer.goOffline())
+    await layer.takeOnline({ poly: { nodes: [{ id: 'layer', kind: 'layer', text: 'original' }] } })
+    layer.upsertNode('layer', { kind: 'layer', text: 'first' })
+    layer.upsertNode('layer', { kind: 'layer', text: 'latest' })
+    await waitFor(() => sockets.length > 1 && layer.getPendingNodeWrites().length === 0 && layer.getNodes()[0]?.text === 'latest')
+    const server = await serverDocs(layer.getSessionId(), layer.anonToken)
+    assert.equal(server.poly.nodes[0].text, 'latest')
+})
+
+test('live-9 changing rooms cannot publish queued node content into the target session', { skip }, async (t) => {
+    const source = mk({ nodeThrottleMs: 200 })
+    const target = mk()
+    t.after(() => { source.layer.goOffline(); target.layer.goOffline() })
+    await source.layer.takeOnline({ poly: { nodes: [] } })
+    await target.layer.takeOnline({ poly: { nodes: [] } })
+    source.layer.upsertNode('private', { kind: 'layer', text: 'source room content' })
+    await waitFor(() => source.layer.getNodes().some((node) => node.id === 'private'))
+    source.layer.upsertNode('queued', { kind: 'layer', text: 'private queued content' })
+    await source.layer.joinSession(target.layer.getSessionId())
+    await sleep(300)
+    const server = await serverDocs(target.layer.getSessionId(), target.layer.anonToken)
+    assert.deepEqual(server.poly.nodes, [])
+})
+
+test('live-10 ambiguous reconnect holds the draft after an accepted edit was replaced by a peer', { skip }, async (t) => {
+    class BlackholeText extends OriginWebSocket {
+        static tripped = false
+        addEventListener(type, handler) {
+            if (type !== 'message') return super.addEventListener(type, handler)
+            return super.addEventListener(type, (event) => { if (!this.blackhole) handler(event) })
+        }
+        send(data) {
+            super.send(data)
+            if (!BlackholeText.tripped && JSON.parse(data).type === 'doc-edit') {
+                BlackholeText.tripped = true
+                this.blackhole = true
+            }
+        }
+    }
+    const author = mk({ Socket: BlackholeText })
+    const peer = mk()
+    t.after(() => { author.layer.goOffline(); peer.layer.goOffline() })
+    const editor = new FakeEditor('abc')
+    author.layer.bindEditor({ docId: 'main', editor })
+    await author.layer.takeOnline([DOC('abc')])
+    const sessionId = author.layer.getSessionId()
+    await peer.layer.joinSession(sessionId)
+    editor.value = 'axbc'
+    author.layer.updateLocalText('main', editor.value)
+    await waitFor(() => peer.layer.docs.get('main').serverText === 'axbc')
+    peer.layer.updateLocalText('main', 'azbc')
+    await waitFor(() => peer.layer.docs.get('main').serverText === 'azbc')
+    author.sockets[0].close()
+    await waitFor(() => author.sockets.length > 1 && author.layer.getStatus() === 'online')
+    const server = await serverDocs(sessionId, author.layer.anonToken)
+    assert.equal(server.docs[0].text, 'azbc')
+    assert.equal(editor.value, 'axbc')
+    assert.equal(author.events.find(({ name, p }) => name === 'doc-reject' && p.reason === 'reconnect_ambiguous')?.p.snapshot.text, 'azbc')
+    assert.equal(author.sockets[1].sentFrames.some((frame) => frame.type === 'doc-edit'), false)
 })

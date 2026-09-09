@@ -486,21 +486,32 @@ def test_ticket_jti_cache_prunes_expired(clock):
     assert len(svc._seen_jti) == 1  # only t2 remains
 
 
-def test_ticket_jti_cache_evicts_oldest_when_full(clock):
+def test_ticket_jti_cache_preserves_replay_protection_when_full(clock):
     svc = _service(clock)
     svc._JTI_CAP = 2  # shrink the hard cap for the test
-    jtis = []
-    for i in range(3):
-        token = svc.mint_ticket(f"u-{i}", "n", Kind.ANON)
-        # capture the jti minted into this token before it is consumed
-        payload = json.loads(GsSerializer(svc._config.secret, clock=clock).loads(token))
-        jtis.append(payload["jti"])
+    consumed = [svc.mint_ticket(f"u-{i}", "n", Kind.MEMBER) for i in range(2)]
+    for token in consumed:
         svc.redeem_ticket(token)
-        clock.advance(1)  # stagger expiries so the oldest is unambiguous
-    assert len(svc._seen_jti) == 2  # capped
-    assert jtis[0] not in svc._seen_jti  # oldest-expiry evicted first
-    assert jtis[1] in svc._seen_jti
-    assert jtis[2] in svc._seen_jti
+    clock.advance(1)
+    waiting = svc.mint_ticket("next", "n", Kind.MEMBER)
+    with pytest.raises(AuthError, match="capacity"):
+        svc.redeem_ticket(waiting)
+    for token in consumed:
+        with pytest.raises(AuthError, match="already redeemed"):
+            svc.redeem_ticket(token)
+    # Once the old tokens actually expire, the still-valid waiting ticket works.
+    clock.advance(120)
+    assert svc.redeem_ticket(waiting).user_id == "next"
+
+
+@pytest.mark.parametrize("fraction", [0.0, 0.5])
+def test_ticket_replay_stays_blocked_through_the_final_valid_second(clock, fraction):
+    svc = _service(clock)
+    token = svc.mint_ticket("u", "n", Kind.MEMBER)
+    svc.redeem_ticket(token)
+    clock.advance(120 + fraction)
+    with pytest.raises(AuthError, match="already redeemed"):
+        svc.redeem_ticket(token)
 
 
 # --------------------------------------------------------------------------- #

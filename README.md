@@ -70,7 +70,12 @@ The build writes the generated bundle to `dist/index.js`.
 .venv/bin/python -m pytest -m slow -q    # load/perf smoke
 .venv/bin/python -m ruff check .         # lint
 npm run test:sdk                        # SDK bundle + node tests
+.venv/bin/python scripts/test-sdk-ci.py # all SDK tests, including live and perf
 ```
+
+The CI runner creates and stops its own local server with a temporary database
+and fresh credentials. It enables the live tests and performance checks, which
+the plain `test:sdk` command skips unless configured explicitly.
 
 Deployment pipelines can stamp `public/deployment-meta.json` at image build
 time. Local runs synthesize a `{"git_hash": "dev"}` placeholder.

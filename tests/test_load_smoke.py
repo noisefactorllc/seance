@@ -59,6 +59,8 @@ _LOAD_ENV = {
     "SEANCE_LIMIT_SEND_QUEUE_FRAMES": "1000000",
     "SEANCE_LIMIT_SEND_QUEUE_BYTES": "1073741824",
     "SEANCE_LIMIT_JOINS_PER_IP_MIN": "1000",
+    # One creator plus the twenty independent client identities.
+    "SEANCE_LIMIT_ANON_MINTS_PER_IP_HOUR": str(NUM_CLIENTS + 1),
     "SEANCE_LIMIT_PING_INTERVAL": "600",
     "SEANCE_LIMIT_PING_TIMEOUT": "600",
 }
@@ -201,11 +203,11 @@ async def test_load_smoke_20_clients(world):  # noqa: F811
     session_id, _owner_token = await create_session(ctx)
 
     clients = [LoadClient(i, record_latency=(i == 0)) for i in range(NUM_CLIENTS)]
-    for client in clients:
-        await client.connect(ctx.server, session_id)
     observer = clients[0]
 
     try:
+        for client in clients:
+            await client.connect(ctx.server, session_id)
         # 20 clients emit concurrently for DURATION_S seconds.
         async with asyncio.timeout(DURATION_S + DRAIN_TIMEOUT_S):
             await asyncio.gather(*(client.run_sender() for client in clients))

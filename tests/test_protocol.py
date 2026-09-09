@@ -877,3 +877,22 @@ def test_protocol_error_defaults():
     assert err.detail == ""
     assert err.ref_type is None
     assert str(err) == ""
+
+
+@pytest.mark.parametrize("number", ["1e999", "-1e999", "1.8e308"])
+def test_parse_frame_rejects_overflowing_finite_json_numbers(number):
+    with pytest.raises(ProtocolError) as exc:
+        parse_frame(
+            '{"type":"state-update","id":"x","value":' + number + '}',
+            max_len=65536,
+        )
+    assert exc.value.code is ErrorCode.bad_frame
+
+
+@pytest.mark.parametrize("number", [float("inf"), float("-inf"), float("nan")])
+def test_validate_message_rejects_nested_nonfinite_values(number, limits):
+    with pytest.raises(ProtocolError) as exc:
+        validate_message(
+            {"type": "state-update", "id": "x", "value": {"nested": [number]}}, limits
+        )
+    assert exc.value.code is ErrorCode.bad_frame

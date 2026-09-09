@@ -91,7 +91,7 @@ dedicated alias; when both are set, `SEANCE_LIMIT_*` **wins**. Aliases:
 | `MAX_SESSIONS` | 1000 | Global **persisted-row** cap, live and frozen alike (`503` on create when reached). Because frozen rows count until `FROZEN_SESSION_TTL` expires them, this bounds total creates per TTL window, not concurrent sessions; size the two together (section 8). |
 | `MAX_CONNECTIONS` | 4096 | Global connection cap (`4429` on join when reached). |
 | `SEND_QUEUE_FRAMES` | 256 | Per-connection send-queue frame budget (overflow → shed cursors, then `4408`). |
-| `SEND_QUEUE_BYTES` | 1048576 | Per-connection send-queue byte budget. |
+| `SEND_QUEUE_BYTES` | 1048576 | Per-connection send-queue byte budget. One snapshot may additionally reserve up to `MAX_SESSION_BYTES + MAX_FRAME` bytes, including while it is being sent; a second snapshot needing that reservation closes `4408`. The frame-count limit still applies. |
 | `ANON_TTL` | 2592000 | Anon token lifetime, seconds (30 d); also the `SEANCE_ANON` cookie `Max-Age`. |
 | `TICKET_TTL` | 120 | Ticket lifetime, seconds. |
 | `GS_SESSION_TTL` | 604800 | gs cookie fallback max-age, seconds (7 d). |
@@ -192,8 +192,10 @@ so without this a run of cheap creates could hold the global cap for a whole
 retention window and answer `503` to everyone else. Nothing a client has seen is
 affected: the row is deleted only while `first_joined_at IS NULL`, a marker set
 on the first connection ever admitted and carried through freeze and thaw. Rows
-written before this marker existed load as `NULL`, so a pre-upgrade database
-keeps the long retention for sessions it cannot classify.
+written before this marker existed receive `first_joined_at = 0` during migration,
+meaning unknown prior join history, so they keep the long retention. New sessions
+start with `NULL`. This migration cannot recover rows already pruned by an older
+server or identify legacy rows already migrated to schema 4 with a `NULL` marker.
 
 The sweep computes `cutoff = now - frozen_session_ttl`, lists rows with
 `frozen_at IS NOT NULL AND frozen_at < cutoff`, then serializes each candidate

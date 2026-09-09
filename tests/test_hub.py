@@ -807,3 +807,38 @@ async def test_close_connections_schedules_close_on_every_live_connection(hub_fa
     hub.close_connections(1001, "server shutting down")
 
     assert [c.closed for c in conns] == [(1001, "server shutting down")] * 3
+
+
+async def test_checkpoint_keeps_edits_during_store_write_dirty(hub_factory, clock, monkeypatch):
+    hub, store = await hub_factory(checkpoint_secs=1.0)
+    sid = await hub.create_session(member("owner"))
+    owner = FakeConn(member("owner"))
+    session = await hub.connect(sid, owner)
+    session.handle(owner.connection_id, {"type": "state-update", "id": "x", "value": "before"})
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_save = store.save_session
+
+    async def paused_save(session_id, payload):
+        entered.set()
+        await release.wait()
+        await real_save(session_id, payload)
+
+    monkeypatch.setattr(store, "save_session", paused_save)
+    save_task = asyncio.create_task(hub.checkpoint(session))
+    try:
+        async with asyncio.timeout(2):
+            await entered.wait()
+            session.handle(
+                owner.connection_id, {"type": "state-update", "id": "x", "value": "during"}
+            )
+            release.set()
+            await save_task
+    finally:
+        release.set()
+        await save_task
+
+    assert (await store.load_session(sid))["state"][0]["value"] == "before"
+    clock.advance(2.0)
+    await hub.scan()
+    assert (await store.load_session(sid))["state"][0]["value"] == "during"

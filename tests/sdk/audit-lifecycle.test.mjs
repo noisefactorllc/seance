@@ -93,7 +93,7 @@ test('RED: SDK-2 a non-retryable doc-reject (too_large) is resubmitted forever',
     assert.equal(docEdits(sockets[0]).length, 2)
 })
 
-test('RED: SDK-2b a doc-reject for an unknown document (snapshot: null) loops the same way', async () => {
+test('SDK-2b an editor absent from the session keeps local text without proposing an unknown document', async () => {
     const { layer, sockets } = harness({ defaultDocId: 'deck:A' })
     const editorB = new FakeEditor('')
     layer.bindEditor({ docId: 'deck:B', editor: editorB })
@@ -105,15 +105,9 @@ test('RED: SDK-2b a doc-reject for an unknown document (snapshot: null) loops th
     editorB.value = 'deck b text'
     layer.updateLocalText('deck:B', editorB.value, { source: 'editor' })
     await tick()
-    for (let round = 0; round < 5; round += 1) {
-        const last = docEdits(sockets[0]).at(-1)
-        sockets[0].receive({
-            type: 'doc-reject', seq: 10 + round, docId: 'deck:B', baseRev: last.baseRev, authorSeq: last.authorSeq,
-            reason: 'invalid', snapshot: null,
-        })
-        await tick()
-    }
-    assert.equal(docEdits(sockets[0]).length, 1, `SDK sent ${docEdits(sockets[0]).length} identical proposals for a document the server does not have`)
+    assert.equal(docEdits(sockets[0]).length, 0, 'a document absent from the snapshot cannot receive proposals')
+    assert.equal(editorB.value, 'deck b text')
+    layer.goOffline()
 })
 
 test('RED: SDK-3 a dropped doc-edit (error rate_limited, no ack) is retransmitted with the same authorSeq and the lane recovers', async () => {
@@ -156,7 +150,8 @@ test('SDK-3c an in-flight proposal with no answer at all is retransmitted, then 
     layer.on('disconnect', (d) => disconnects.push(d))
     editor.value = 'abXc'
     layer.updateLocalText('main', 'abXc', { source: 'editor' })
-    await sleep(80)
+    const deadline = Date.now() + 2000
+    while (!sockets[1] && Date.now() < deadline) await sleep(5)
     const sent = docEdits(sockets[0])
     assert.equal(sent.length, 3, 'original + 2 retransmits')
     assert.ok(sent.every((f) => f.authorSeq === sent[0].authorSeq))

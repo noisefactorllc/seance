@@ -12,8 +12,14 @@ Trust boundaries:
 - **Identity is server-derived only.** Nothing identity-bearing is trusted from a
   request body or an unstamped envelope field (`app/identity.py`,
   `app/protocol.py` `validate_message` + `stamp`).
-- **Storage is identity-only.** No IP, email, cookie, or token is ever persisted
-  — only `user_id` / username material (`app/store.py` module docstring).
+- **Server identity records contain no credentials.** They retain only `user_id`
+  / username material, without IP addresses, email addresses, cookies, or tokens
+  (`app/store.py` module docstring).
+- **Browser identity is a bearer capability.** The SDK retains anonymous tokens
+  in the application's per-tab `sessionStorage`, scoped to the Seance base URL,
+  so cross-site clients retain ownership after reload. Same-origin application
+  scripts can read that token; it never enters a share URL. Hosts can disable or
+  replace this storage with `anonTokenStorage` (see `sdk/README.md`).
 
 ---
 
@@ -244,9 +250,12 @@ unless it coordinates with the running seance process.
   `test_identity.py::test_ticket_single_use`.
 - **Time-bounded.** TTL is `ticket_ttl` (default 120 s); an expired ticket is
   rejected (`::test_ticket_expired`). The seen-set is pruned of expired `jti`s
-  and capped at 10 000 entries (oldest evicted) to bound memory
+  and capped at 10 000 entries to bound memory. Unexpired entries are never
+  evicted: new redemptions fail closed at capacity until expired entries can be
+  pruned. Records remain through the ticket's final valid timestamp second
   (`::test_ticket_jti_cache_prunes_expired`,
-  `::test_ticket_jti_cache_evicts_oldest_when_full`).
+  `::test_ticket_jti_cache_preserves_replay_protection_when_full`,
+  `::test_ticket_replay_stays_blocked_through_the_final_valid_second`).
 - End-to-end member identity: `test_integration_scenarios.py::test_g_ticket_flow_yields_member_identity`.
 
 **Residual — single-process assumption.** The `jti` seen-set is in-process.

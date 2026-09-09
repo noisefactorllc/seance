@@ -256,14 +256,17 @@ class IdentityService:
         return Identity(user_id=user_id, username=username, kind=kind)
 
     def _prune_jti(self, now: float) -> None:
-        expired = [jti for jti, exp in self._seen_jti.items() if exp <= now]
+        # GsSerializer accepts a ticket for the entire final timestamp second:
+        # int(now) <= ts + ttl. Keep its redemption record through that boundary.
+        expired = [jti for jti, exp in self._seen_jti.items() if int(now) > exp]
         for jti in expired:
             del self._seen_jti[jti]
 
     def _record_jti(self, jti: str, expiry: float) -> None:
         if len(self._seen_jti) >= self._JTI_CAP:
-            oldest = min(self._seen_jti, key=self._seen_jti.__getitem__)
-            del self._seen_jti[oldest]
+            # Evicting an unexpired record makes its consumed ticket reusable.
+            # Refuse new redemptions until pruning safely frees capacity instead.
+            raise AuthError("ticket redemption capacity reached")
         self._seen_jti[jti] = expiry
 
     # -- gs cookie ----------------------------------------------------------- #

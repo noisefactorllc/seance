@@ -23,6 +23,7 @@ Conventions:
 """
 
 import json
+import math
 import re
 import uuid
 from enum import StrEnum
@@ -680,8 +681,13 @@ def _reject_constant(name: str):
     raise ValueError(f"non-finite JSON constant {name}")
 
 
-def _nesting_depth_exceeds(obj, limit: int) -> bool:
-    """Iteratively check container nesting depth (no recursion, no stack risk)."""
+def validate_json_values(obj, limit: int) -> None:
+    """Reject deep containers and non-finite numbers without recursive traversal.
+
+    ``parse_constant`` only rejects literal NaN/Infinity. Valid JSON numbers such
+    as ``1e999`` overflow Python floats too, so inspect decoded values as well.
+    This also guards callers that supply already-decoded message dictionaries.
+    """
     stack = [(obj, 1)]
     while stack:
         node, depth = stack.pop()
@@ -690,13 +696,13 @@ def _nesting_depth_exceeds(obj, limit: int) -> bool:
         elif isinstance(node, list):
             children = node
         else:
+            if isinstance(node, float) and not math.isfinite(node):
+                raise ValueError("JSON number is not finite")
             continue
         if depth > limit:
-            return True
+            raise ValueError("JSON nests too deeply")
         for child in children:
-            if isinstance(child, (dict, list)):
-                stack.append((child, depth + 1))
-    return False
+            stack.append((child, depth + 1))
 
 
 def parse_frame(raw: str, *, max_len: int) -> dict:
@@ -712,12 +718,11 @@ def parse_frame(raw: str, *, max_len: int) -> dict:
         raise ProtocolError(ErrorCode.too_large, "frame exceeds maximum size")
     try:
         obj = json.loads(raw, parse_constant=_reject_constant)
+        validate_json_values(obj, MAX_FRAME_DEPTH)
     except (ValueError, RecursionError) as exc:
         raise ProtocolError(ErrorCode.bad_frame, "frame is not valid JSON") from exc
     if not isinstance(obj, dict):
         raise ProtocolError(ErrorCode.bad_frame, "frame must be a JSON object")
-    if _nesting_depth_exceeds(obj, MAX_FRAME_DEPTH):
-        raise ProtocolError(ErrorCode.bad_frame, "frame nests too deeply")
     return obj
 
 
@@ -733,8 +738,10 @@ def validate_message(msg: dict, limits: Limits) -> dict:
         raise ProtocolError(ErrorCode.bad_frame, "frame must be a JSON object")
     # parse_frame already enforces this for WebSocket frames; repeating it here
     # covers every other producer of a message dict (tests, future transports).
-    if _nesting_depth_exceeds(msg, MAX_FRAME_DEPTH):
-        raise ProtocolError(ErrorCode.bad_frame, "frame nests too deeply")
+    try:
+        validate_json_values(msg, MAX_FRAME_DEPTH)
+    except ValueError as exc:
+        raise ProtocolError(ErrorCode.bad_frame, str(exc)) from exc
     msg_type = msg.get("type")
     if not isinstance(msg_type, str):
         raise ProtocolError(ErrorCode.bad_frame, "missing or invalid type", ref_type="type")

@@ -66,11 +66,22 @@ async def create_app(env: Mapping[str, str]) -> web.Application:
     _configure_logging()
 
     store = await Store.open(config.db_path)
-    directory = await make_directory(config.directory_dsn)
-    identity = IdentityService(config, directory)
-    hub = Hub(config, store)
-    ws_handler = make_websocket_handler(config, hub, identity)
-    app = build_app(config, hub, identity, ws_handler=ws_handler)
+    directory = None
+    try:
+        directory = await make_directory(config.directory_dsn)
+        identity = IdentityService(config, directory)
+        hub = Hub(config, store)
+        ws_handler = make_websocket_handler(config, hub, identity)
+        app = build_app(config, hub, identity, ws_handler=ws_handler)
+    except BaseException:
+        # No application cleanup callbacks exist yet. Release the SQLite worker
+        # and lifetime lock even when construction fails or is cancelled.
+        try:
+            if directory is not None:
+                await directory.close()
+        finally:
+            await store.close()
+        raise
 
     async def _on_startup(_app: web.Application) -> None:
         await hub.start()

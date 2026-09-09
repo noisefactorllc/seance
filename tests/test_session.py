@@ -136,6 +136,32 @@ def test_join_guests_off_blocks_anon_not_member(clock):
     s.join(FakeConn(member("m1")))
 
 
+def test_anonymous_creator_can_rejoin_after_disabling_guests_and_thaw(clock):
+    s = Session("s", "creator", Limits(), clock)
+    owner = FakeConn(anon("creator"))
+    s.join(owner)
+    s.handle(owner.connection_id, {"type": "mod-guests", "allowed": False})
+    s.leave(owner.connection_id)
+    thawed = Session.thaw("s", s.freeze_snapshot(), Limits(), clock)
+    returning = FakeConn(anon("creator"))
+    thawed.join(returning)
+    assert returning.sent[0]["you"]["is_owner"] is True
+    assert thawed.settings.guests_allowed is False
+
+
+def test_explicit_anonymous_owner_can_open_another_tab_when_guests_disabled(clock):
+    s = Session("s", "creator", Limits(), clock)
+    owner = FakeConn(member("creator"))
+    guest = FakeConn(anon("next-owner"))
+    s.join(owner)
+    s.join(guest)
+    s.handle(owner.connection_id, {"type": "mod-transfer", "target_user": "next-owner"})
+    s.handle(guest.connection_id, {"type": "mod-guests", "allowed": False})
+    returning = FakeConn(anon("next-owner"))
+    s.join(returning)
+    assert returning.sent[0]["you"]["is_owner"] is True
+
+
 def test_join_roster_full_refused_4429_but_extra_tab_admitted(clock):
     s = Session("s", "creator", Limits(max_clients=2), clock)
     s.join(FakeConn(member("m1")))
