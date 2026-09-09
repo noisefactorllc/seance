@@ -135,19 +135,85 @@ online.getNodeRev()  // -> current poly rev
 - `takeOnline({ poly: { programText, nodes } })` seeds the node lane on
   session creation. See "Menu actions" above.
 
+Status:
+
+`online.getStatus()` and the `'status'` event use four values: `'offline'`,
+`'connecting'` (first connection and every automatic reconnect), `'online'`,
+and `'readonly'` (joined, but Seance refuses this user's writes). Treat
+`'readonly'` as its own UI state: `updateLocalText()`, `upsertNode()` and
+`deleteNode()` drop silently and emit `'readonly-write'` while it lasts.
+
+Connection lifecycle:
+
+- An involuntary socket drop (server restart, proxy reload, sleep, network
+  blip) reconnects automatically with exponential backoff from
+  `reconnectBaseMs` (500) to `reconnectMaxMs` (8000), with 25 % jitter
+  (`reconnectJitter`) and no attempt cap. The same `anon_token` is sent, so
+  the identity is stable across reconnects while this layer instance lives.
+  Local text typed while reconnecting is kept and rebased on the recovery
+  snapshot; an edit that was in flight when the socket dropped is detected in
+  the snapshot and not applied twice.
+- Server close codes decide whether the SDK comes back. `4401` (kicked),
+  `4403` (banned or guests not allowed), `4423` (locked), `4404`, `4409`
+  (dialect mismatch) and `4400` are terminal: the SDK goes `'offline'` and
+  stays there. Everything else (`1006`, `1011`, `4408`, `4429`) reconnects.
+- Every involuntary close emits `'disconnect'` with
+  `{ code, reason, kind, willReconnect, attempt }`, where `kind` is one of
+  `'kicked'`, `'forbidden'`, `'locked'`, `'limit'`, `'unknown-session'`,
+  `'dialect-mismatch'`, `'protocol'`, `'slow-consumer'` or `null`. Show the
+  user something when `willReconnect` is `false`.
+- A join refused during the handshake rejects `takeOnline()` /
+  `joinSession()` with an `Error` carrying `code` (the wire error code, for
+  example `'dialect_mismatch'`, `'unknown_session'`, `'forbidden'`) and
+  `closeCode`.
+- A proposal that gets no answer is retransmitted with its original
+  `authorSeq` (Seance answers retransmits from its retry cache, so nothing is
+  applied twice); after `inFlightRetransmits` (3) unanswered resends spaced
+  `inFlightTimeoutMs` (10000) apart the socket is dropped and the reconnect
+  path takes over. A `rate_limited` error resends after its `retry_after`.
+- Large pastes are sent as sequential chunks of at most 15,000 characters so
+  no frame exceeds Seance's 64 KiB cap.
+- `goOffline()` forgets the session (`lastSeq`, retry state); the next join
+  starts clean.
+
+Identity:
+
+`anon_token` from the first `welcome` is kept in memory only. Persist it
+yourself (for example in `localStorage`, keyed by `seanceUrl`) and pass it
+back as `createOnlineDslLayer({ anonToken })` if the creator must keep
+ownership across page reloads; the cross-site cookie path does not reach a
+browser WebSocket.
+
+Text offsets:
+
+Every offset in `edit` and cursor `range` objects is a UTF-16 code unit
+index, exactly what `String.prototype.slice`, `selectionStart` and Handfish
+produce. Seance stores documents in the same units.
+
 Events:
 
 ```js
-online.on('status', status => {})
+online.on('status', status => {})                 // 'offline' | 'connecting' | 'online' | 'readonly'
+online.on('disconnect', ({ code, reason, kind, willReconnect, attempt }) => {})
+online.on('offline', () => {})                    // after goOffline()
+online.on('welcome', frame => {})                 // identity, roster, owner, settings, dialect
 online.on('snapshot', ({ docs }) => {})
 online.on('remote-edit', ({ docId, edit, rev }) => {})
+online.on('local-text', ({ docId, text, meta }) => {})
 online.on('doc-ack', frame => {})
-online.on('doc-reject', frame => {})
+online.on('doc-reject', frame => {})              // reason 'stale' is retried automatically; anything else holds the local text until it changes
+online.on('validation-error', ({ docId, text, meta, reason }) => {})
+online.on('readonly-write', payload => {})
+online.on('moderation', frame => {})
 online.on('node-snapshot', ({ rev, nodes }) => {})
 online.on('remote-node', ({ op, node, id, removed }) => {})
 online.on('node-reject', ({ id, reason, attempts }) => {})
-online.on('error', frameOrEvent => {})
+online.on('error', payload => {})                 // a server error frame ({ type: 'error', code, detail }), an Error (code, detail, frame), or a WebSocket error event
 ```
+
+`'error'` payloads are not uniform: read `payload.code` when present and never
+assume `payload.message` exists. Surface `doc-reject` to the user; a held
+proposal means the document on screen is ahead of the session.
 
 Teardown:
 
@@ -156,3 +222,10 @@ const unbind = online.bindEditor({ docId: 'main', editor })
 unbind()
 online.goOffline()
 ```
+
+Binding the same document twice replaces the earlier binding (its listeners
+are removed first).
+
+Do not call `takeOnline()` twice concurrently: each call creates a server
+session (creation is rate limited per address) and the earlier connection is
+superseded and rejected.

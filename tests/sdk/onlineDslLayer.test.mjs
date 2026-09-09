@@ -653,7 +653,8 @@ test('goOffline clears pending proposal timers before a later join adopts state'
         second,
         FakeWebSocket.instances[1],
         [{ id: 'main', title: 'Program', kind: 'dsl', rev: 7, text: 'server()', default: true }],
-        { type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'], resume: { last_seq: 2 } },
+        // goOffline() forgets the previous session, so the next hello carries no resume.
+        { type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'] },
     )
     assert.equal(FakeWebSocket.instances[1].sent.some((msg) => msg.type === 'doc-edit'), false)
     assert.equal(FakeWebSocket.instances[1].sent.some((msg) => msg.type === 'doc-cursor'), false)
@@ -905,7 +906,7 @@ test('doc rejects with snapshots rebase and resubmit local optimistic edits', as
         seq: 3,
         docId: 'main',
         authorSeq: 1,
-        reason: 'stale-revision',
+        reason: 'stale',
         snapshot: { id: 'main', rev: 2, text: 'abYc' },
     })
     await tick()
@@ -1337,7 +1338,7 @@ test('goOffline clears the node queue so pending upserts are not resent after re
         second,
         FakeWebSocket.instances[1],
         [],
-        { type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'], resume: { last_seq: 2 } },
+        { type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'] },
         { rev: 0, programText: '', frame: null, nodes: [] },
     )
     assert.equal(FakeWebSocket.instances[1].sent.some((msg) => msg.type === 'poly-token-upsert'), false)

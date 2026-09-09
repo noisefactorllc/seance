@@ -6,6 +6,24 @@ const DEFAULT_DIALECT = 'noisemaker-dsl'
 const DEFAULT_PROPOSAL_THROTTLE_MS = 110
 const DEFAULT_CURSOR_THROTTLE_MS = 80
 const DEFAULT_NODE_THROTTLE_MS = 120
+const DEFAULT_INFLIGHT_TIMEOUT_MS = 10000
+const DEFAULT_INFLIGHT_RETRANSMITS = 3
+const DEFAULT_RETRY_AFTER_MS = 250
+// One doc-edit frame must stay under the server's 64 KiB frame cap and its
+// 65,536-char edit.text cap even when every character is four bytes.
+const MAX_EDIT_CHARS = 15000
+// protocol.md section 7. Terminal codes mean "do not come back on your own".
+const CLOSE_KINDS = {
+    4400: 'protocol',
+    4401: 'kicked',
+    4403: 'forbidden',
+    4404: 'unknown-session',
+    4408: 'slow-consumer',
+    4409: 'dialect-mismatch',
+    4423: 'locked',
+    4429: 'limit',
+}
+const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4403, 4404, 4409, 4423])
 
 export function createOnlineDslLayer(options = {}) {
     return new OnlineDslLayer(options)
@@ -22,6 +40,9 @@ class OnlineDslLayer {
             nodeThrottleMs: DEFAULT_NODE_THROTTLE_MS,
             reconnectBaseMs: 500,
             reconnectMaxMs: 8000,
+            reconnectJitter: 0.25,
+            inFlightTimeoutMs: DEFAULT_INFLIGHT_TIMEOUT_MS,
+            inFlightRetransmits: DEFAULT_INFLIGHT_RETRANSMITS,
             urlParam: 'seance',
             stripUrlParams: ['code'],
             ...options,
@@ -54,6 +75,8 @@ class OnlineDslLayer {
         this._nodeSendTimer = null
         this._lastNodeSendAt = 0
         this._nodeAuthorSeq = 0
+        this._lastProposalAt = 0
+        this._resyncPending = false
     }
 
     on(eventName, handler) {
@@ -83,12 +106,20 @@ class OnlineDslLayer {
         this._reconnecting = Boolean(options.reconnect)
         if (!this._reconnecting) this._connectedAtLeastOnce = false
         this._lastConnectError = null
+        const Socket = this.WebSocket
+        if (!Socket) {
+            this._setStatus('offline')
+            throw new Error('WebSocket is not available')
+        }
         this._setStatus('connecting')
 
-        const Socket = this.WebSocket
-        if (!Socket) throw new Error('WebSocket is not available')
-
-        const socket = new Socket(this._wsUrl(sessionId))
+        let socket
+        try {
+            socket = new Socket(this._wsUrl(sessionId))
+        } catch (error) {
+            this._setStatus('offline')
+            throw error
+        }
         this.socket = socket
         this._connectDeferred = deferred()
 
@@ -104,20 +135,55 @@ class OnlineDslLayer {
         })
         addSocketListener(socket, 'message', (event) => {
             if (this.socket !== socket) return
-            this._handleMessage(JSON.parse(event.data))
+            let msg
+            try {
+                msg = JSON.parse(event.data)
+            } catch (error) {
+                const fault = clientError('bad_frame', 'unparseable frame from server', error)
+                if (this._connectDeferred) {
+                    // A poisoned welcome/snapshot must fail the join, not hang it.
+                    this._lastConnectError = fault
+                    this._connectDeferred.reject(fault)
+                    this._connectDeferred = null
+                }
+                this._emit('error', fault)
+                return
+            }
+            try {
+                this._handleMessage(msg)
+            } catch (error) {
+                this._handleClientFault(msg, error)
+            }
         })
-        addSocketListener(socket, 'close', () => {
+        addSocketListener(socket, 'close', (event) => {
             if (this.socket !== socket) return
             this.socket = null
+            const code = Number(event?.code) || 0
+            const reason = String(event?.reason || '')
+            const kind = CLOSE_KINDS[code] || null
+            const terminal = TERMINAL_CLOSE_CODES.has(code)
             const hadConnected = this._connectedAtLeastOnce
+            if (this._lastConnectError && this._lastConnectError.closeCode === undefined) {
+                // The error frame already rejected connect(); give that Error the close code too.
+                this._lastConnectError.closeCode = code
+            }
             if (this._connectDeferred) {
-                this._connectDeferred.reject(this._lastConnectError || new Error('connection closed before session snapshot'))
+                const error = this._lastConnectError || new Error(reason || 'connection closed before session snapshot')
+                if (error.closeCode === undefined) error.closeCode = code
+                if (kind && !error.code) error.code = kind
+                this._connectDeferred.reject(error)
                 this._connectDeferred = null
             }
-            if (!this._intentionalDisconnect && hadConnected && this.sessionId) {
+            const willReconnect = !this._intentionalDisconnect && hadConnected && Boolean(this.sessionId) && !terminal
+            if (!this._intentionalDisconnect) {
+                this._emit('disconnect', { code, reason, kind, willReconnect, attempt: this._reconnectAttempts })
+            }
+            if (willReconnect) {
                 this._scheduleReconnect()
                 return
             }
+            if (terminal) this._intentionalDisconnect = true
+            this._clearInFlight()
             if (this.status !== 'offline') this._setStatus('offline')
         })
         addSocketListener(socket, 'error', (event) => {
@@ -137,6 +203,7 @@ class OnlineDslLayer {
         this._intentionalDisconnect = true
         clearTimeout(this._reconnectTimer)
         this._reconnectTimer = null
+        this._stopInFlightTimers()
         if (this._connectDeferred) {
             this._connectDeferred.reject(new Error('connection closed'))
             this._connectDeferred = null
@@ -183,12 +250,17 @@ class OnlineDslLayer {
         for (const doc of this.docs.values()) {
             clearTimeout(doc.proposalTimer)
             clearTimeout(doc.cursorTimer)
-            doc.inFlight = null
+            this._clearDocInFlight(doc)
             doc.queuedText = null
+            doc.holdText = null
             doc.proposalTimer = null
             doc.cursorTimer = null
             clearRemoteSelections(doc.binding)
         }
+        // Nothing from the previous session applies to the next one.
+        this.lastSeq = 0
+        this._reconnectAttempts = 0
+        this._resyncPending = false
         clearTimeout(this._nodeSendTimer)
         this._nodeSendTimer = null
         this._nodeQueue = []
@@ -199,6 +271,7 @@ class OnlineDslLayer {
     bindEditor(binding) {
         const normalized = normalizeBinding(binding, this.options.defaultDocId)
         const doc = this._ensureDoc(normalized.docId)
+        doc.cleanupBinding?.()
         doc.binding = normalized
         doc.features = detectHandfishFeatures(normalized.editor)
         const current = readEditorText(normalized)
@@ -336,9 +409,10 @@ class OnlineDslLayer {
                 this._emit('welcome', msg)
                 break
             case 'session-snapshot':
-                this._adoptDocs(msg.docs || [], { preserveLocal: this._reconnecting })
+                this._adoptDocs(msg.docs || [], { preserveLocal: this._reconnecting || this._resyncPending })
                 this._adoptPoly(msg.poly)
                 if (this._reconnecting) this._recoverNodeQueue()
+                this._resyncPending = false
                 this._setStatus(this.readonly ? 'readonly' : 'online')
                 this._connectedAtLeastOnce = true
                 this._reconnecting = false
@@ -347,7 +421,9 @@ class OnlineDslLayer {
                 this._resolveConnect(msg)
                 break
             case 'doc-snapshot':
-                this._adoptDocs(msg.docs || [])
+                // doc-create / doc-reset rebroadcast every document; leave the ones
+                // that did not change alone so their in-flight and local text survive.
+                this._adoptDocs(msg.docs || [], { skipUnchanged: true })
                 break
             case 'doc-edit':
                 this._receiveRemoteEdit(msg)
@@ -382,6 +458,7 @@ class OnlineDslLayer {
                     this._connectDeferred.reject(this._lastConnectError)
                     this._connectDeferred = null
                 }
+                this._handleProposalError(msg)
                 this._emit('error', msg)
                 break
         }
@@ -391,6 +468,7 @@ class OnlineDslLayer {
         this._adoptServerDefaultDoc(snapshots)
         for (const snapshot of snapshots) {
             const doc = this._ensureDoc(snapshot.id)
+            if (options.skipUnchanged && doc.rev === snapshot.rev && doc.serverText === snapshot.text) continue
             const oldServerText = doc.serverText
             const localText = doc.text
             const hasLocalText = options.preserveLocal && !this.readonly && (
@@ -398,13 +476,20 @@ class OnlineDslLayer {
                 Boolean(doc.inFlight) ||
                 doc.queuedText !== null
             )
+            // An edit that was in flight when the socket dropped may or may not have
+            // landed before the drop. Decide before rebasing so it is neither applied
+            // twice nor lost.
+            const base = hasLocalText && doc.inFlight
+                ? resolveReconnectBase(oldServerText, doc.inFlight.edit, snapshot.text)
+                : oldServerText
             doc.rev = snapshot.rev
             doc.serverText = snapshot.text
-            doc.inFlight = null
+            this._clearDocInFlight(doc)
+            doc.holdText = null
             if (hasLocalText) {
-                const snapshotEdit = diffText(oldServerText, snapshot.text)
+                const snapshotEdit = diffText(base, snapshot.text)
                 doc.text = snapshotEdit
-                    ? rebaseTextWithLocalEdit(oldServerText, localText, snapshotEdit)
+                    ? rebaseTextWithLocalEdit(base, localText, snapshotEdit)
                     : localText
                 doc.queuedText = doc.text
                 this._applyRemoteText(doc, doc.text, null, 'snapshot-rebase')
@@ -441,6 +526,7 @@ class OnlineDslLayer {
 
         clearTimeout(placeholder.proposalTimer)
         clearTimeout(placeholder.cursorTimer)
+        clearTimeout(placeholder.inFlightTimer)
         this.docs.delete(placeholder.docId)
         this.activeDefaultDocId = serverDefault.id
     }
@@ -469,29 +555,34 @@ class OnlineDslLayer {
     _receiveRemoteEdit(msg) {
         const doc = this._ensureDoc(msg.docId)
         const oldServer = doc.serverText
+        const edit = msg.edit
         const hadLocal = doc.text !== doc.serverText
-        doc.serverText = applyTextEdit(doc.serverText, msg.edit)
+        doc.serverText = applyTextEdit(doc.serverText, edit)
         doc.rev = msg.rev
-        let editorEdit = msg.edit
+        doc.holdText = null
+        let editorEdit = edit
 
         if (hadLocal) {
-            doc.text = rebaseTextWithLocalEdit(oldServer, doc.text, msg.edit)
+            doc.text = rebaseTextWithLocalEdit(oldServer, doc.text, edit)
             doc.queuedText = doc.text
             editorEdit = null
         } else {
             doc.text = doc.serverText
         }
         this._applyRemoteText(doc, doc.text, editorEdit, 'remote')
-        this._emit('remote-edit', { docId: msg.docId, edit: msg.edit, rev: msg.rev })
+        if (hadLocal) this._scheduleProposal(doc)
+        this._emit('remote-edit', { docId: msg.docId, edit, rev: msg.rev })
     }
 
     _receiveAck(msg) {
         const doc = this._ensureDoc(msg.docId)
         if (!doc.inFlight || doc.inFlight.authorSeq !== msg.authorSeq) return
         const inFlight = doc.inFlight
-        doc.serverText = applyTextEdit(doc.serverText, msg.edit)
+        const edit = msg.edit
+        doc.serverText = applyTextEdit(doc.serverText, edit)
         doc.rev = msg.rev
-        doc.inFlight = null
+        this._clearDocInFlight(doc)
+        doc.holdText = null
         if (doc.queuedText !== null) {
             doc.text = doc.queuedText
             doc.queuedText = null
@@ -505,7 +596,7 @@ class OnlineDslLayer {
             rev: msg.rev,
             authorSeq: msg.authorSeq,
         })
-        this._emit('doc-ack', msg)
+        this._emit('doc-ack', { ...msg, edit })
     }
 
     _receiveReject(msg) {
@@ -528,9 +619,16 @@ class OnlineDslLayer {
                 this._applyRemoteText(doc, doc.text, null, 'reject-snapshot')
             }
         }
-        doc.inFlight = null
+        this._clearDocInFlight(doc)
         if (!hadLocal || this.readonly) doc.queuedText = null
-        this._scheduleProposal(doc)
+        if (msg.reason === 'stale') {
+            this._scheduleProposal(doc)
+        } else {
+            // invalid / too_large / duplicate / unknown: the same proposal would be
+            // refused again. Keep the local text visible but do not resend it until
+            // it changes or the server state moves.
+            doc.holdText = doc.text
+        }
         this._emit('doc-reject', msg)
     }
 
@@ -632,7 +730,7 @@ class OnlineDslLayer {
             for (const doc of this.docs.values()) {
                 clearTimeout(doc.proposalTimer)
                 doc.proposalTimer = null
-                doc.inFlight = null
+                this._clearDocInFlight(doc)
                 doc.queuedText = null
                 doc.text = doc.serverText
                 this._applyRemoteText(doc, doc.serverText, null, 'readonly')
@@ -653,16 +751,22 @@ class OnlineDslLayer {
 
     _scheduleReconnect() {
         if (this._reconnectTimer || !this.sessionId) return
+        this._stopInFlightTimers()
         this._setStatus('connecting')
         const base = Math.max(0, Number(this.options.reconnectBaseMs) || 0)
         const max = Math.max(base, Number(this.options.reconnectMaxMs) || base)
-        const delay = Math.min(max, base * (2 ** this._reconnectAttempts))
+        const jitter = Math.min(1, Math.max(0, Number(this.options.reconnectJitter) || 0))
+        const spread = 1 - jitter + 2 * jitter * Math.random()
+        const delay = Math.round(Math.min(max, base * (2 ** this._reconnectAttempts)) * spread)
         this._reconnectAttempts += 1
         this._reconnectTimer = setTimeout(() => {
             this._reconnectTimer = null
-            this.connect(this.sessionId, { reconnect: true }).catch((error) => {
-                this._emit('error', error)
-            })
+            Promise.resolve()
+                .then(() => this.connect(this.sessionId, { reconnect: true }))
+                .catch((error) => {
+                    // The socket 'error' listener or the error frame already emitted this one.
+                    if (error !== this._lastConnectError) this._emit('error', error)
+                })
         }, delay)
     }
 
@@ -673,7 +777,9 @@ class OnlineDslLayer {
             return
         }
         if (doc.proposalTimer) return
-        const elapsed = Date.now() - doc.lastProposalAt
+        // Pace per document and across documents: the proposal lane is one token
+        // bucket per connection (protocol.md section 8), not one per document.
+        const elapsed = Date.now() - Math.max(doc.lastProposalAt, this._lastProposalAt)
         const delay = Math.max(0, this.options.proposalThrottleMs - elapsed)
         doc.proposalTimer = setTimeout(() => {
             doc.proposalTimer = null
@@ -684,23 +790,121 @@ class OnlineDslLayer {
     _drainProposal(doc) {
         if (!this.socket || this.status !== 'online' || this.readonly || doc.inFlight) return
         if (doc.text === doc.serverText) return
-        const edit = diffText(doc.serverText, doc.text)
-        if (!edit) return
-        const authorSeq = ++doc.authorSeq
-        doc.inFlight = {
-            authorSeq,
-            baseRev: doc.rev,
-            edit,
-            desiredText: doc.text,
+        if (doc.holdText !== null && doc.text === doc.holdText) return
+        if (Date.now() - this._lastProposalAt < this.options.proposalThrottleMs) {
+            this._scheduleProposal(doc)
+            return
         }
-        doc.lastProposalAt = Date.now()
-        this._send({
+        let edit = diffText(doc.serverText, doc.text)
+        if (!edit) return
+        let desiredText = doc.text
+        if (edit.text.length > MAX_EDIT_CHARS) {
+            // Ship a large paste as a sequence of accepted chunks instead of one
+            // frame the server refuses (max_frame / max_doc_edit_text).
+            edit = { start: edit.start, end: edit.end, text: edit.text.slice(0, MAX_EDIT_CHARS) }
+            desiredText = applyTextEdit(doc.serverText, edit)
+        }
+        const authorSeq = ++doc.authorSeq
+        const frame = {
             type: 'doc-edit',
             docId: doc.docId,
             baseRev: doc.rev,
             authorSeq,
             edit,
-        })
+        }
+        doc.inFlight = {
+            authorSeq,
+            baseRev: doc.rev,
+            edit,
+            desiredText,
+            frame,
+            retransmits: 0,
+        }
+        const now = Date.now()
+        doc.lastProposalAt = now
+        this._lastProposalAt = now
+        this._send(frame)
+        this._armInFlightTimer(doc)
+    }
+
+    _armInFlightTimer(doc, delay = this.options.inFlightTimeoutMs) {
+        clearTimeout(doc.inFlightTimer)
+        doc.inFlightTimer = null
+        if (!(delay > 0)) return
+        doc.inFlightTimer = setTimeout(() => {
+            doc.inFlightTimer = null
+            this._retransmitInFlight(doc)
+        }, delay)
+    }
+
+    _retransmitInFlight(doc) {
+        const inFlight = doc.inFlight
+        if (!inFlight || !this.socket || this.status !== 'online') return
+        if (inFlight.retransmits >= this.options.inFlightRetransmits) {
+            // No ack, reject, or error after repeated resends: the socket is dead or
+            // the server is not answering. Drop it and let the reconnect path rebase
+            // against a fresh snapshot.
+            this.socket.close()
+            return
+        }
+        inFlight.retransmits += 1
+        // Same authorSeq: the server answers a retransmit from its retry cache, so an
+        // edit that did land is acked again rather than applied twice.
+        this._send(inFlight.frame)
+        this._armInFlightTimer(doc)
+    }
+
+    _handleProposalError(msg) {
+        if (msg?.code === 'rate_limited') {
+            // The frame was dropped, not applied (protocol.md section 8). Resend the
+            // in-flight proposals after retry_after with their original authorSeq.
+            const seconds = Number(msg.retry_after)
+            const delay = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DEFAULT_RETRY_AFTER_MS
+            for (const doc of this.docs.values()) {
+                if (doc.inFlight) this._armInFlightTimer(doc, delay)
+            }
+            return
+        }
+        if (msg?.code === 'too_large' && (!msg.ref_type || msg.ref_type === 'doc-edit')) {
+            for (const doc of this.docs.values()) {
+                if (!doc.inFlight) continue
+                const { authorSeq, baseRev } = doc.inFlight
+                this._clearDocInFlight(doc)
+                doc.holdText = doc.text
+                this._emit('doc-reject', {
+                    type: 'doc-reject', docId: doc.docId, baseRev, authorSeq, reason: 'too_large', snapshot: null,
+                })
+            }
+        }
+    }
+
+    _handleClientFault(msg, error) {
+        this._emit('error', clientError(
+            'client_desync',
+            `failed to apply ${msg?.type || 'frame'}: ${error?.message || error}`,
+            error,
+            msg,
+        ))
+        if (this._resyncPending || !this.socket) return
+        this._resyncPending = true
+        this._send({ type: 'session-state' })
+    }
+
+    _clearDocInFlight(doc) {
+        clearTimeout(doc.inFlightTimer)
+        doc.inFlightTimer = null
+        doc.inFlight = null
+    }
+
+    _stopInFlightTimers() {
+        for (const doc of this.docs.values()) {
+            clearTimeout(doc.inFlightTimer)
+            doc.inFlightTimer = null
+        }
+    }
+
+    _clearInFlight() {
+        for (const doc of this.docs.values()) this._clearDocInFlight(doc)
     }
 
     _scheduleNodeSend() {
@@ -852,6 +1056,8 @@ class OnlineDslLayer {
                 serverText: '',
                 authorSeq: 0,
                 inFlight: null,
+                inFlightTimer: null,
+                holdText: null,
                 queuedText: null,
                 proposalTimer: null,
                 cursorTimer: null,
@@ -932,6 +1138,37 @@ function deferred() {
         reject = rej
     })
     return { promise, resolve, reject }
+}
+
+function clientError(code, detail, cause = null, frame = null) {
+    const error = new Error(detail)
+    error.type = 'error'
+    error.code = code
+    error.detail = detail
+    if (cause) error.cause = cause
+    if (frame) error.frame = frame
+    return error
+}
+
+// Which text was the server holding when it built the snapshot: the one before
+// or after our in-flight edit? Exact matches are decided outright; otherwise
+// prefer the explanation that leaves the smaller unexplained delta.
+function resolveReconnectBase(oldServerText, inFlightEdit, snapshotText) {
+    let applied
+    try {
+        applied = applyTextEdit(oldServerText, inFlightEdit)
+    } catch {
+        return oldServerText
+    }
+    if (applied === snapshotText) return applied
+    if (oldServerText === snapshotText) return oldServerText
+    const ifNotApplied = editMagnitude(diffText(oldServerText, snapshotText))
+    const ifApplied = editMagnitude(diffText(applied, snapshotText))
+    return ifApplied < ifNotApplied ? applied : oldServerText
+}
+
+function editMagnitude(edit) {
+    return edit ? (edit.end - edit.start) + edit.text.length : 0
 }
 
 function protocolError(msg) {

@@ -6,5 +6,6 @@ export {
     transformEdit,
     transformOffset,
     transformSelection,
+    validateEdit,
 } from './textOps.js'
 export { peerColor, peerPalette } from './peerColors.js'

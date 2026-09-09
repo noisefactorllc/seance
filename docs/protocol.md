@@ -134,6 +134,10 @@ The same body is re-sent on demand for any `session-state` request (§7).
 ## 3. Client → server messages
 
 Caps are character length for strings and compact-JSON byte length for `value`.
+Text offsets (`edit.start`/`edit.end`, cursor `range.start`/`range.end`) and
+the text caps count **UTF-16 code units**, the unit browsers produce
+(`String.length`, `selectionStart`); the server stores documents in the same
+units (`textdoc.py` `to_utf16_units`). An astral character is two units.
 Unlisted keys are dropped by the validator; the server never trusts envelope
 fields from a client. "Lane" selects the rate bucket (§6); "Who" is the
 authorization gate (`session.py` `handle`).
@@ -316,7 +320,7 @@ fault is logged server-side without tearing down the connection
 | code | meaning |
 |---|---|
 | `4400` | protocol violation (bad hello; `max_violations` reached, default 3) |
-| `4401` | kicked by the owner |
+| `4401` | kicked by the owner (no `error` frame precedes it; the close code is the only signal, and a client must not rejoin on its own) |
 | `4403` | banned, guests-not-allowed, or unauthorized identity |
 | `4404` | unknown session |
 | `4408` | slow consumer (send queue overflowed after cursor shedding) |

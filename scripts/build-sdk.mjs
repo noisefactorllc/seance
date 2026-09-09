@@ -1,23 +1,48 @@
 #!/usr/bin/env node
+// Concatenating bundler for the zero-dependency browser SDK.
+//
+// Contract: dist/index.js exports exactly what sdk/index.js exports, contains no
+// import statement, and has no duplicate top-level declaration. The build fails
+// loudly on any violation instead of shipping a bundle that 404s in the browser.
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const entry = 'sdk/index.js'
 const sources = [
     'sdk/textOps.js',
     'sdk/peerColors.js',
     'sdk/onlineDslLayer.js',
 ]
 
+// Every import form: named, default, namespace, mixed, side-effect, with or
+// without a semicolon, LF or CRLF, multi-line specifier lists.
+const IMPORT_RE = /^[ \t]*import\s+(?:[^'"]*?\s+from\s+)?['"][^'"]+['"]\s*;?[ \t]*\r?\n?/gm
+const REEXPORT_RE = /^[ \t]*export\s+(?:\{[^}]*\}|\*(?:\s+as\s+[\w$]+)?)\s+from\s+['"][^'"]+['"]/m
+const DECLARATION_RE = /^(export\s+)?(async\s+function\*?|function\*?|class|const|let|var)\s+([A-Za-z_$][\w$]*)/gm
+
+const surface = new Set(Object.keys(await import(pathToFileURL(join(root, entry)).href)))
+const declared = new Map()
+
 const chunks = sources.map((relativePath) => {
-    const source = readFileSync(join(root, relativePath), 'utf8')
-    return [
-        `// ${relativePath}`,
-        source
-            .replace(/^import\s+\{[^}]+\}\s+from\s+['"][^'"]+['"]\n/gm, '')
-            .trim(),
-    ].join('\n')
+    let source = readFileSync(join(root, relativePath), 'utf8')
+    if (REEXPORT_RE.test(source)) {
+        throw new Error(`${relativePath}: re-exports are not supported; export from ${entry} instead`)
+    }
+    source = source.replace(IMPORT_RE, '')
+    if (/^[ \t]*import[\s{'"*]/m.test(source)) {
+        throw new Error(`${relativePath}: an import statement survived stripping`)
+    }
+    source = source.replace(DECLARATION_RE, (match, exported, kind, name) => {
+        if (declared.has(name)) {
+            throw new Error(`duplicate top-level declaration "${name}" in ${relativePath} and ${declared.get(name)}`)
+        }
+        declared.set(name, relativePath)
+        // Only the entry point's surface stays exported; everything else is bundle-private.
+        return surface.has(name) ? match : `${kind} ${name}`
+    })
+    return [`// ${relativePath}`, source.trim()].join('\n')
 })
 
 const output = [
@@ -27,4 +52,14 @@ const output = [
 ].join('\n\n')
 
 mkdirSync(join(root, 'dist'), { recursive: true })
-writeFileSync(join(root, 'dist/index.js'), output)
+const outFile = join(root, 'dist/index.js')
+writeFileSync(outFile, output)
+
+// Prove the bundle loads and matches the entry surface before anyone ships it.
+const bundled = new Set(Object.keys(await import(`${pathToFileURL(outFile).href}?build=${Date.now()}`)))
+const missing = [...surface].filter((name) => !bundled.has(name))
+const extra = [...bundled].filter((name) => !surface.has(name))
+if (missing.length || extra.length) {
+    throw new Error(`dist/index.js surface drift: missing [${missing.join(', ')}] extra [${extra.join(', ')}]`)
+}
+console.log(`built dist/index.js (${output.length} bytes, ${surface.size} exports)`)
