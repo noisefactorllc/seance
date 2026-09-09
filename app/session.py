@@ -825,6 +825,10 @@ class Session:
         self.seq = seq
         body = dict(msg)
         body["rev"] = new_rev
+        # Relay the server's canonical node set (every version == new_rev, ids
+        # sorted, parentId normalized), never the owner's client-side versions:
+        # a peer that trusts relayed versions would derive wrong base_revs.
+        body["nodes"] = self.poly.snapshot()["nodes"]
         self._broadcast(
             body, seq, exclude=conn.connection_id,
             user_id=identity.user_id, username=identity.username, connection_id=conn.connection_id,
