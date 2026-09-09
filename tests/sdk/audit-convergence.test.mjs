@@ -10,7 +10,24 @@ import { transformEdit, applyTextEdit, diffText } from '../../sdk/textOps.js'
 import { FakeWebSocket, FakeEditor, tick } from './audit-harness.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const PY = process.env.SEANCE_PY || join(here, '../../../../seance/.venv/bin/python')
+const repoRoot = join(here, '../..')
+
+// These two cases check the SDK's transform against the server's own
+// implementation, so they need an interpreter that can import `app`. CI
+// installs the requirements against the system Python; a checkout with a
+// virtualenv can point at it with SEANCE_PY. Where neither can import the
+// server, the parity check is skipped rather than failed: it is an oracle
+// comparison, not a statement about the SDK on its own.
+const PY = process.env.SEANCE_PY || 'python3'
+
+function pythonOracleAvailable() {
+    const probe = spawnSync(PY, ['-c', 'import app.textdoc'], { cwd: repoRoot, encoding: 'utf8' })
+    return probe.status === 0
+}
+
+const oracleSkip = pythonOracleAvailable()
+    ? false
+    : `needs a Python that can import app (tried ${PY}; set SEANCE_PY)`
 
 function rng(seed) {
     let s = seed >>> 0
@@ -97,7 +114,7 @@ class ModelDoc {
     }
 }
 
-test('SDK transformEdit matches the server _transform_edit on 20,000 random pairs (Python oracle)', () => {
+test('SDK transformEdit matches the server _transform_edit on 20,000 random pairs (Python oracle)', { skip: oracleSkip }, () => {
     const rand = rng(7)
     const cases = []
     for (let i = 0; i < 20000; i += 1) {
@@ -216,7 +233,7 @@ test(`two peers converge with the server model under random interleavings (${SEE
     assert.equal(failures.length, 0, `${failures.length}/${SEEDS} seeds diverged; first seeds: ${failures.slice(0, 10).map((f) => f.seed).join(',')}`)
 })
 
-test('SDK-14 diffText is UTF-16 based while the server counts code points (astral characters)', () => {
+test('SDK-14 diffText is UTF-16 based while the server counts code points (astral characters)', { skip: oracleSkip }, () => {
     const before = '🎉 party'
     const after = '🎉 party!'
     const edit = diffText(before, after)
