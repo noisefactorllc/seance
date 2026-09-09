@@ -8,6 +8,7 @@ WebSocket handler, then assembles them with :func:`app.httpapi.build_app`. The
 hub's background freeze/checkpoint loop is started on app startup; on shutdown
 every WebSocket is closed with ``1001`` (going away) so aiohttp's handler wait
 ends promptly, and on cleanup every live session is frozen and the store closed.
+Successful health probes are filtered out of the access log.
 
 :func:`run` is the ``bin/app.py`` entrypoint. It fails fast on a configuration
 error (printing it and exiting non-zero) and otherwise hands the app coroutine to
@@ -31,10 +32,24 @@ from app.directory import make_directory
 from app.httpapi import build_app
 from app.hub import Hub
 from app.identity import IdentityService
-from app.store import Store
+from app.store import Store, StoreError
 from app.transport import make_websocket_handler
 
 _LOG = logging.getLogger("seance.main")
+
+
+class _HealthProbeFilter(logging.Filter):
+    """Drop access-log lines for successful ``GET /up`` health probes.
+
+    The container healthcheck and the external monitor together probe about
+    every 20 seconds, which is thousands of identical INFO lines a day burying
+    real errors in journald. A probe that fails still logs, because that is news.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_line = getattr(record, "first_request_line", "")
+        status = getattr(record, "response_status", None)
+        return not (request_line.startswith("GET /up ") and status == 200)
 
 # RFC 6455 "going away": sent to every connected client when the server stops.
 _CLOSE_GOING_AWAY = 1001
@@ -90,6 +105,9 @@ def _configure_logging() -> None:
             format="%(asctime)s %(name)s %(levelname)s %(message)s",
         )
     logging.getLogger("seance.audit").setLevel(logging.INFO)
+    access_log = logging.getLogger("aiohttp.access")
+    if not any(isinstance(existing, _HealthProbeFilter) for existing in access_log.filters):
+        access_log.addFilter(_HealthProbeFilter())
 
 
 def run() -> None:
@@ -104,9 +122,16 @@ def run() -> None:
     except ConfigError as exc:
         print(f"seance: configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    web.run_app(
-        create_app(os.environ),
-        host=config.bind_host,
-        port=config.bind_port,
-        shutdown_timeout=_SHUTDOWN_TIMEOUT,
-    )
+    try:
+        web.run_app(
+            create_app(os.environ),
+            host=config.bind_host,
+            port=config.bind_port,
+            shutdown_timeout=_SHUTDOWN_TIMEOUT,
+        )
+    except StoreError as exc:
+        # Starting a second process on one database is an operator mistake with
+        # an obvious fix, so it reads like the config errors above rather than
+        # like a crash. Anything else keeps its traceback.
+        print(f"seance: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
