@@ -12,6 +12,19 @@ below is taken from the server source and is the authority the code enforces:
 Transport is WebSocket, text frames only, exactly one JSON object per frame. A
 binary frame is a protocol violation. Protocol version is `1`.
 
+**Document offsets are UTF-16 code units.** Every `start` / `end` in `doc-edit`,
+`doc-ack`, `doc-cursor`, and the retained op log counts UTF-16 code units, the
+same unit as JavaScript string indexing (`"a".length`, `selectionStart`), so a
+browser can use its own offsets unchanged. An astral character such as an emoji
+therefore counts as **two**. The server stores document text in the same unit,
+and its JSON encoding escapes each surrogate half, which `JSON.parse`
+reassembles: a client sees ordinary text. A language whose strings index by code
+point (Python, Go, Rust) must convert at the boundary.
+
+**Numbers are JSON numbers a browser can hold.** Every integer field is capped
+at 2^53-1, and the non-standard `NaN`, `Infinity` and `-Infinity` literals are
+rejected as `bad_frame`, as is a frame nested deeper than 64 levels.
+
 ---
 
 ## 1. Connection

@@ -57,7 +57,7 @@ dedicated alias; when both are set, `SEANCE_LIMIT_*` **wins**. Aliases:
 | `SNAPSHOT_RATE` | 0.2 | Snapshot-lane tokens/s (`state-set`, `poly-snapshot`). |
 | `SNAPSHOT_BURST` | 2 | Snapshot-lane burst. |
 | `ABUSE_WINDOW` | 10.0 | Seconds a lane may stay continuously exhausted before close `4429`. |
-| `ANON_MINTS_PER_IP_HOUR` | 10 | `/v1/anon` mints per IP per hour. |
+| `ANON_MINTS_PER_IP_HOUR` | 10 | Fresh anonymous identities minted per IP per hour, across **every** path that mints one: `/v1/anon`, `/v1/me`, session create, and the WebSocket `hello`. A caller presenting a valid token or cookie is not charged. Exhausted: `429` on HTTP, close `4429` with `rate_limited` on the socket. |
 | `CREATES_PER_IP_HOUR` | 10 | Anonymous session creates per resolved client IP per hour, independent of cookies/tokens. |
 | `JOINS_PER_IP_MIN` | 30 | WS joins and session probes per IP per minute. |
 | `CREATES_PER_IDENTITY_HOUR` | 30 | Session creates per identity per hour. |
@@ -85,9 +85,9 @@ dedicated alias; when both are set, `SEANCE_LIMIT_*` **wins**. Aliases:
 | `PING_TIMEOUT` | 60.0 | Seconds without a pong before reap (`1011`). |
 | `FREEZE_GRACE` | 60.0 | Seconds an empty session stays live before freezing to the store. |
 | `CHECKPOINT_OPS` | 500 | seq delta (counts all emitted events, including server frames) that triggers a live checkpoint. |
-| `CHECKPOINT_SECS` | 30.0 | Idle seconds that triggers a live checkpoint. |
+| `CHECKPOINT_SECS` | 30.0 | Seconds **since the last save** that triggers a live checkpoint. A session with no change since that save is skipped, so an idle session is not rewritten. |
 | `FROZEN_SESSION_TTL` | 86400.0 | Seconds a frozen session is retained before the in-process sweep may delete it; `<= 0` disables the sweep. |
-| `MAX_SESSIONS` | 1000 | Global persisted-session cap (`503` on create when reached), including frozen rows. |
+| `MAX_SESSIONS` | 1000 | Global **persisted-row** cap, live and frozen alike (`503` on create when reached). Because frozen rows count until `FROZEN_SESSION_TTL` expires them, this bounds total creates per TTL window, not concurrent sessions; size the two together (section 8). |
 | `MAX_CONNECTIONS` | 4096 | Global connection cap (`4429` on join when reached). |
 | `SEND_QUEUE_FRAMES` | 256 | Per-connection send-queue frame budget (overflow → shed cursors, then `4408`). |
 | `SEND_QUEUE_BYTES` | 1048576 | Per-connection send-queue byte budget. |
@@ -142,7 +142,10 @@ Sessions are in-memory and server-authoritative; SQLite is the durability layer
 
 A file-backed database has exactly one Seance process owner. `Store.open()`
 takes a non-blocking exclusive lock on `<SEANCE_DB>.lock` for its entire
-lifetime and startup fails if another process owns it. Run one process per
+lifetime and startup fails if another process owns it, printing
+`seance: database already in use: <path>` and exiting `1` (an unsupported
+schema version reports the same way). The lock file is empty and is released by
+the kernel when the process dies, so a leftover file is harmless. Run one process per
 database; scale by assigning separate databases, not by placing multiple
 workers over the same SQLite file. In-memory test databases are exempt.
 
@@ -153,13 +156,21 @@ workers over the same SQLite file. In-memory test databases are exempt.
   first-connects share one thawed instance (per-id lock).
 - **Checkpoint** — a background loop runs a scan every
   `max(0.5, min(freeze_grace, checkpoint_secs)/2)` seconds. A **live** session
-  past `checkpoint_ops` of **seq delta** (counting all emitted events, including
-  server frames) **or** `checkpoint_secs` idle is saved with `frozen_at = NULL`
-  (durability without eviction).
+  that has changed since its last save (a positive seq delta) and is past
+  `checkpoint_ops` of **seq delta** (counting all emitted events, including
+  server frames) **or** `checkpoint_secs` since that save is written with
+  `frozen_at = NULL` (durability without eviction). A session with nothing new
+  is skipped entirely, so idle sessions cost no writes. A join counts as a
+  change (welcome plus snapshot bump `seq`), so the first scan after a connect
+  still clears the stale `frozen_at`.
 - **Freeze** — an **empty** session past `freeze_grace` is saved with
   `frozen_at = <now>` and evicted from memory.
-- **Shutdown** — `on_cleanup` freezes every live session and closes the store, so
-  a restart thaws the same DB cleanly.
+- **Shutdown** — on `SIGTERM`, `on_shutdown` closes every WebSocket with `1001`
+  (going away) so aiohttp's in-flight handler wait ends at once rather than
+  running to its timeout, then `on_cleanup` freezes every live session and
+  closes the store, so a restart thaws the same DB cleanly. Allow a stop grace
+  period comfortably above the 10 s shutdown timeout plus the time to freeze
+  every live session.
 
 `frozen_at` is the frozen/live marker: an integer timestamp for a frozen row,
 `NULL` for a live (checkpointed) row.
@@ -182,7 +193,10 @@ with `Store.delete_session(id)`.
 The store exposes the two primitives used by that sweep:
 
 - `Store.list_frozen_older_than(ts)` → ids of rows with `frozen_at IS NOT NULL
-  AND frozen_at < ts`, sorted.
+  AND frozen_at < ts`, sorted. Served by the `sessions_frozen_at` index, which
+  `Store.open()` creates if absent, so an existing database picks it up on the
+  next start. Without it the sweep scans every row's overflow pages (measured at
+  64 ms per pass over 64 rows of 8 MB, against 0.1 ms indexed).
 - `Store.delete_session(id)` → delete one session row and its session-scoped
   bans. Audit rows are intentionally retained.
 
@@ -246,7 +260,12 @@ nothing else; no tokens, cookies, IPs, or message bodies.
 
 **Logging.** Structured single-line logs to **stdout** (journald convention),
 INFO by default, format `%(asctime)s %(name)s %(levelname)s %(message)s`. Loggers:
-`seance.main`, `seance.hub`, `seance.http`, `seance.transport`, `seance.audit`.
+`seance.main`, `seance.hub`, `seance.http`, `seance.transport`, `seance.audit`,
+plus aiohttp's own `aiohttp.access` (one line per request) and `aiohttp.server`,
+which together produce most of the volume. Successful `GET /up` probes are
+filtered out of the access log, since a healthcheck and an external monitor
+between them would otherwise write thousands of identical lines a day; a probe
+that **fails** still logs.
 Tokens, cookies, IPs, and frame payloads are never logged (`transport.py` never
 logs payloads; client IPs live only in RAM for rate limiting). Unexpected HTTP
 errors log only the method and matched route template, never the raw request
@@ -280,7 +299,8 @@ monitor needs it — it discloses live counts.
 
 | Symptom | Where to look |
 |---|---|
-| Startup exits non-zero | `ConfigError` on stderr names the bad/missing variable (`main.py`). |
+| Startup exits non-zero | A one-line `seance: ...` on stderr names the cause: a bad or missing variable (`ConfigError`), a database another process holds, or an unsupported schema version. |
+| No `GET /up` lines in the log | Expected: successful probes are filtered (section 6). Failing probes and every other route still log. |
 | WS connect returns 403 pre-upgrade | `Origin` not in `SEANCE_ALLOWED_ORIGINS`. |
 | WS connect returns 429 pre-upgrade | `joins_per_ip_min` exceeded for the client IP. |
 | Member cookie ignored | `SEANCE_GS_SERIALIZER_KEY` unset, or IP binding mismatch (check `trusted_proxies`), or member deleted (→ falls through to anon; threat-model §2.4). |
@@ -315,6 +335,26 @@ seance.example.com {
 }
 ```
 
+**Sizing.** Both caps are worth setting deliberately, because the defaults are
+generous relative to a small container:
+
+- **Disk**: worst case `MAX_SESSIONS x MAX_SESSION_BYTES` plus the WAL, so the
+  defaults allow about 8 GB. Frozen rows count toward `MAX_SESSIONS` until
+  `FROZEN_SESSION_TTL` deletes them, so with the 24 h default the cap is really
+  "creates per day": once 1,000 rows exist, every create answers `503` until the
+  sweep catches up. Lower `MAX_SESSIONS`, shorten the TTL, or provision for the
+  full product.
+- **RAM**: a live session costs roughly its own JSON size plus about 0.1 MB per
+  connection, and a thaw peaks transiently at a few times the payload. A 1 GiB
+  container therefore holds on the order of 100 max-size sessions, far fewer
+  than `MAX_SESSIONS` allows to exist; set `MAX_CONNECTIONS` and `MAX_SESSIONS`
+  from the memory limit rather than leaving both at the defaults.
+- **Durability**: SQLite runs in WAL mode with `synchronous=NORMAL`, which is
+  crash-safe against a process crash but can lose the last commits on sudden
+  power loss or a host reset. Sessions are re-created by clients, so this trades
+  a little durability for far fewer fsyncs; raise it to `FULL` only if that
+  trade is wrong for your deployment.
+
 Deployment checklist:
 
 - Store secrets in environment variables or `*_FILE` secret paths; never bake
@@ -332,6 +372,8 @@ Deployment checklist:
   peers on private networks. Do not include public reverse proxies or broad
   client-address ranges.
 - Keep `/up` wired to readiness monitoring. It performs a real store probe.
+- Size `MAX_SESSIONS`, `FROZEN_SESSION_TTL` and `MAX_CONNECTIONS` against the
+  container's disk and memory limits (see Sizing above), not just the defaults.
 - Optionally stamp `public/deployment-meta.json` during image build with
   `bin/stamp_deployment_meta.py`; otherwise Seance serves a `dev` placeholder.
 
