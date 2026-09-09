@@ -42,6 +42,14 @@ def _harden_wal_sidecars(path: str) -> None:
             pass
 
 
+class StoreError(RuntimeError):
+    """A store could not be opened: the operator has to act, not read a traceback.
+
+    Subclasses :class:`RuntimeError` so existing callers and tests that expect
+    one keep working; :func:`app.main.run` turns it into a one-line startup error.
+    """
+
+
 def _acquire_store_lock(path: str) -> int | None:
     """Hold an exclusive process lock for a file-backed SQLite database."""
     if path == ":memory:":
@@ -53,7 +61,7 @@ def _acquire_store_lock(path: str) -> int | None:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         os.close(fd)
-        raise RuntimeError(f"database already in use: {path}") from exc
+        raise StoreError(f"database already in use: {path}") from exc
     except BaseException:
         os.close(fd)
         raise
@@ -111,7 +119,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
         sidecars to mode ``0600`` (skipped for the ``:memory:`` database). Records
         the current :data:`_SCHEMA_VERSION` on first open; a database at an older
         version is migrated forward in place; any other stored version raises
-        :class:`RuntimeError`.
+        :class:`StoreError`, as does a database another process already holds.
         """
         lock_fd = _acquire_store_lock(path)
         db = None
@@ -148,7 +156,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
                 )
                 await db.commit()
             elif row[0] != _SCHEMA_VERSION:
-                raise RuntimeError(
+                raise StoreError(
                     f"unsupported schema version {row[0]!r}, expected {_SCHEMA_VERSION!r}"
                 )
             _harden_wal_sidecars(path)
