@@ -41,7 +41,7 @@ from aiohttp import WSMsgType, web
 
 from app import protocol
 from app.clientip import resolve_client_ip
-from app.identity import AuthError
+from app.identity import AuthError, MintLimited
 from app.protocol import ErrorCode, ProtocolError
 from app.ratelimit import KeyedLimiter, LaneLimiter
 from app.session import JoinRefused
@@ -296,6 +296,14 @@ def make_websocket_handler(
                 cookie=request.cookies.get("SESSION"),
                 client_ip=client_ip,
             )
+        except MintLimited:
+            # A fresh guest identity, not a bad credential: say slow down.
+            await _send_and_close(
+                ws,
+                protocol.error_frame(ErrorCode.rate_limited, detail="anon mint rate limit"),
+                protocol.CLOSE_LIMIT,
+            )
+            return ws
         except AuthError:
             await _send_and_close(
                 ws,

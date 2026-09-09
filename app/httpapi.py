@@ -37,7 +37,7 @@ from app import __version__, protocol
 from app.clientip import resolve_client_ip
 from app.config import Config
 from app.hub import Hub, HubError
-from app.identity import IdentityService, Kind
+from app.identity import IdentityService, Kind, MintLimited
 from app.ratelimit import KeyedLimiter
 
 # The create body seeds session content directly (state values, poly frame).
@@ -112,7 +112,6 @@ class _HttpApi:
         self._clock = clock
         self._meta_path = meta_path
         self._ws_handler = ws_handler
-        self._anon_limiter = KeyedLimiter(config.limits.anon_mints_per_ip_hour, _ANON_WINDOW, clock)
         self._create_limiter = KeyedLimiter(
             config.limits.creates_per_ip_hour, _ANON_WINDOW, clock
         )
@@ -186,7 +185,8 @@ class _HttpApi:
 
     async def anon(self, request: web.Request) -> web.StreamResponse:
         client_ip = self._client_ip(request)
-        if not self._anon_limiter.take(client_ip):
+        # The same budget every other minting path charges (IdentityService).
+        if not self._identity.take_mint(client_ip):
             return web.json_response(
                 {"error": "rate_limited", "retry_after": int(_ANON_WINDOW)}, status=429
             )
@@ -210,12 +210,17 @@ class _HttpApi:
         return web.json_response({"ticket": token})
 
     async def me(self, request: web.Request) -> web.StreamResponse:
-        identity, minted = await self._identity.resolve(
-            ticket=None,
-            anon_token=self._anon_credential(request),
-            cookie=request.cookies.get("SESSION"),
-            client_ip=self._client_ip(request),
-        )
+        try:
+            identity, minted = await self._identity.resolve(
+                ticket=None,
+                anon_token=self._anon_credential(request),
+                cookie=request.cookies.get("SESSION"),
+                client_ip=self._client_ip(request),
+            )
+        except MintLimited:
+            return web.json_response(
+                {"error": "rate_limited", "retry_after": int(_ANON_WINDOW)}, status=429
+            )
         body = {
             "user_id": identity.user_id,
             "username": identity.username,
@@ -232,12 +237,17 @@ class _HttpApi:
 
     async def create_session(self, request: web.Request) -> web.StreamResponse:
         client_ip = self._client_ip(request)
-        identity, minted = await self._identity.resolve(
-            ticket=None,
-            anon_token=self._anon_credential(request),
-            cookie=request.cookies.get("SESSION"),
-            client_ip=client_ip,
-        )
+        try:
+            identity, minted = await self._identity.resolve(
+                ticket=None,
+                anon_token=self._anon_credential(request),
+                cookie=request.cookies.get("SESSION"),
+                client_ip=client_ip,
+            )
+        except MintLimited:
+            return web.json_response(
+                {"error": "rate_limited", "retry_after": int(_ANON_WINDOW)}, status=429
+            )
         if identity.kind == Kind.ANON and not self._create_limiter.take(client_ip):
             return web.json_response(
                 {"error": "rate_limited", "retry_after": int(_ANON_WINDOW)}, status=429

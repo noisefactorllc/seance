@@ -168,6 +168,50 @@ async def test_anon_mint_rate_limited(app_factory):
     assert body["retry_after"] > 0
 
 
+async def test_me_mints_are_metered_per_source(app_factory):
+    """/v1/me mints a fresh identity for an uncredentialed caller, so it is metered."""
+    ctx = await app_factory(SEANCE_LIMIT_ANON_MINTS_PER_IP_HOUR="2")
+
+    statuses = []
+    for _ in range(3):
+        ctx.client.session.cookie_jar.clear()  # arrive with no credential each time
+        response = await ctx.client.get("/v1/me", headers={"Origin": ALLOWED})
+        statuses.append(response.status)
+
+    assert statuses == [200, 200, 429]
+
+
+async def test_every_minting_path_shares_one_source_budget(app_factory):
+    """One budget, whichever door the fresh identity comes through."""
+    ctx = await app_factory(SEANCE_LIMIT_ANON_MINTS_PER_IP_HOUR="2")
+
+    assert (await ctx.client.post("/v1/anon", headers={"Origin": ALLOWED})).status == 200
+    ctx.client.session.cookie_jar.clear()
+    assert (await ctx.client.get("/v1/me", headers={"Origin": ALLOWED})).status == 200
+
+    ctx.client.session.cookie_jar.clear()
+    spent = await ctx.client.post("/v1/sessions", headers={"Origin": ALLOWED})
+    assert spent.status == 429
+    assert (await spent.json())["error"] == "rate_limited"
+    ctx.client.session.cookie_jar.clear()
+    assert (await ctx.client.post("/v1/anon", headers={"Origin": ALLOWED})).status == 429
+
+
+async def test_a_returning_identity_is_never_charged_a_mint(app_factory):
+    """Only minting is metered: a valid token must keep working past the cap."""
+    ctx = await app_factory(SEANCE_LIMIT_ANON_MINTS_PER_IP_HOUR="1")
+    minted = await ctx.client.post("/v1/anon", headers={"Origin": ALLOWED})
+    token = (await minted.json())["anon_token"]
+
+    for _ in range(5):
+        ctx.client.session.cookie_jar.clear()
+        response = await ctx.client.get(
+            "/v1/me", headers={"Origin": ALLOWED, "X-Seance-Anon": token}
+        )
+        assert response.status == 200
+        assert (await response.json())["user_id"]
+
+
 # --------------------------------------------------------------------------- #
 # POST /v1/ticket
 # --------------------------------------------------------------------------- #

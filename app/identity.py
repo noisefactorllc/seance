@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from app.ratelimit import KeyedLimiter
+
 if TYPE_CHECKING:
     from app.config import Config
     from app.directory import MemberDirectory
@@ -41,6 +43,9 @@ if TYPE_CHECKING:
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+
+# The window ``anon_mints_per_ip_hour`` is counted over.
+_MINT_WINDOW = 3600.0
 
 
 class Kind(StrEnum):
@@ -67,6 +72,15 @@ class AuthError(Exception):
 
     The message is a short reason code for logs; it never contains token or
     cookie material.
+    """
+
+
+class MintLimited(AuthError):
+    """A source asked for more fresh anonymous identities than its hourly budget.
+
+    A subclass of :class:`AuthError` so any caller that only knows how to refuse
+    a credential still refuses; callers that can say "slow down" answer with the
+    rate-limited status or close code instead.
     """
 
 
@@ -157,6 +171,10 @@ class IdentityService:
         self._directory = directory
         self._clock = clock
         self._limits = config.limits
+        # One budget for every path that mints a fresh anonymous identity: the
+        # /v1/anon endpoint, /v1/me, session create, and the websocket hello.
+        # Metering only one of them capped a quarter of the supply.
+        self._mints = KeyedLimiter(self._limits.anon_mints_per_ip_hour, _MINT_WINDOW, clock)
         # Anon tokens and tickets are signed with seance's own key.
         self._local = GsSerializer(config.secret, clock=clock)
         # gs cookies use gs's serializer key; mirror gs's fall back to its
@@ -313,4 +331,12 @@ class IdentityService:
             except AuthError:
                 pass  # invalid/expired anon token -> mint a fresh one
 
+        # Only a mint is metered: an identity that comes back with a valid
+        # credential costs nothing and must never be refused for rate.
+        if not self.take_mint(client_ip):
+            raise MintLimited("anon mint rate limit exceeded")
         return self.mint_anon()
+
+    def take_mint(self, client_ip: str) -> bool:
+        """Charge one fresh anonymous identity to ``client_ip``; False when spent."""
+        return self._mints.take(client_ip)

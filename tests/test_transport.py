@@ -299,6 +299,34 @@ async def test_owner_kick_closes_target_4401_and_rejoin_works(harness):
     assert frame["user_id"] == b_uid
 
 
+async def test_hello_mint_past_the_budget_closes_4429(harness):
+    """A hello that mints a guest identity is metered like every other mint path."""
+    ctx = await harness.server(SEANCE_LIMIT_ANON_MINTS_PER_IP_HOUR="1")
+    sid = await ctx.hub.create_session(_member())
+
+    first = await harness.ws(ctx, sid)
+    await _welcome(first)
+
+    second = await harness.ws(ctx, sid)
+    frames = await _drain(second)
+    assert frames[-1]["type"] == "error"
+    assert frames[-1]["code"] == "rate_limited"
+    assert await _await_close(second) == 4429
+
+
+async def test_hello_with_a_valid_anon_token_is_not_charged_a_mint(harness):
+    ctx = await harness.server(SEANCE_LIMIT_ANON_MINTS_PER_IP_HOUR="1")
+    sid = await ctx.hub.create_session(_member())
+
+    first = await harness.ws(ctx, sid)
+    welcome = await _welcome(first)
+    token = welcome["anon_token"]
+
+    for _ in range(3):
+        again = await harness.ws(ctx, sid, hello={"anon_token": token})
+        assert (await _welcome(again))["you"]["user_id"] == welcome["you"]["user_id"]
+
+
 async def test_owner_ban_blocks_rejoin_4403(harness):
     ctx = await harness.server()
     sid, ws_a, b_uid, ws_b, b_token = await _owner_and_guest(harness, ctx)
