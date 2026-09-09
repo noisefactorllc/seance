@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS bans (
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, session_id TEXT,
   actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
 """
 
     def __init__(
@@ -233,7 +234,12 @@ CREATE TABLE IF NOT EXISTS audit (
         _harden_wal_sidecars(self._path)
 
     async def list_frozen_older_than(self, ts: int) -> list[str]:
-        """Return sorted ids of frozen sessions whose ``frozen_at`` is strictly < ``ts``."""
+        """Return sorted ids of frozen sessions whose ``frozen_at`` is strictly < ``ts``.
+
+        Served by the ``sessions_frozen_at`` index: ``frozen_at`` sits after six
+        large TEXT columns, so a scan walks every row's overflow pages, which the
+        retention sweep pays on every pass.
+        """
         async with self._db.execute(
             "SELECT id FROM sessions WHERE frozen_at IS NOT NULL AND frozen_at < ? "
             "ORDER BY id",

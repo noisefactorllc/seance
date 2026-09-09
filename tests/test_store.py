@@ -272,6 +272,26 @@ async def test_delete_session(tmp_path):
         await store.close()
 
 
+async def test_retention_sweep_query_uses_the_frozen_at_index(tmp_path):
+    """The sweep runs every 15 s; without the index it scans every row's overflow pages."""
+    store = await Store.open(str(tmp_path / "test.db"))
+    try:
+        async with store._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='sessions_frozen_at'"
+        ) as cur:
+            assert await cur.fetchone() is not None
+        async with store._db.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE frozen_at IS NOT NULL "
+            "AND frozen_at < ? ORDER BY id",
+            (0,),
+        ) as cur:
+            plan = " ".join(str(row[-1]) for row in await cur.fetchall())
+        assert "sessions_frozen_at" in plan, plan
+        assert "SCAN sessions" not in plan, plan
+    finally:
+        await store.close()
+
+
 async def test_list_frozen_older_than_boundary(tmp_path):
     store = await Store.open(str(tmp_path / "test.db"))
     try:
