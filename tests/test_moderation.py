@@ -272,6 +272,44 @@ def test_readonly_blocks_target_write_not_others(clock):
     assert "m" not in h.session.readonly_users
 
 
+def test_readonly_blocks_chat_but_not_presence_or_reads(clock):
+    """Read-only means no new persisted content. Chat is persisted; cursors are not."""
+    h = Harness(clock)
+    h.owner_do({"type": "mod-readonly", "target_user": "m", "readonly": True})
+    h.mem.sent.clear()
+    h.owner.sent.clear()
+
+    h.session.handle(h.mem.connection_id, {"type": "chat-message", "message": "hello"})
+    assert frames(h.mem, "error")[0]["code"] == "readonly"
+    assert list(h.session.chat) == []
+    assert frames(h.owner, "chat-message") == []
+
+    # Presence and reads still work: a viewer can point at code and resync.
+    h.mem.sent.clear()
+    h.session.handle(
+        h.mem.connection_id,
+        {"type": "poly-cursor", "mode": "text", "range": {"start": 0, "end": 0}},
+    )
+    h.session.handle(h.mem.connection_id, {"type": "session-state"})
+    assert frames(h.mem, "error") == []
+    assert frames(h.owner, "poly-cursor")
+    assert frames(h.mem, "session-snapshot")
+
+
+def test_readonly_user_can_still_recall_their_own_chat(clock):
+    """Muting stops new content; it does not trap what the user already said."""
+    h = Harness(clock)
+    h.session.handle(h.mem.connection_id, {"type": "chat-message", "message": "oops"})
+    message_id = frames(h.mem, "chat-message")[-1]["message_id"]
+    h.owner_do({"type": "mod-readonly", "target_user": "m", "readonly": True})
+    h.mem.sent.clear()
+
+    h.session.handle(h.mem.connection_id, {"type": "chat-recall", "message_id": message_id})
+
+    assert frames(h.mem, "error") == []
+    assert list(h.session.chat) == []
+
+
 def test_readonly_cannot_target_self(clock):
     h = Harness(clock)
     h.owner_do({"type": "mod-readonly", "target_user": "owner", "readonly": True})

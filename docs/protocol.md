@@ -149,7 +149,7 @@ authorization gate (`session.py` `handle`).
 | `state-update` | `id`, `value` | — | `id`≤128, `value`≤8192 B | fast | writers |
 | `data-update` | `id`, `role`, `key`, `value` | — | `id`≤128, `role`≤64, `key`≤128, `value`≤8192 B | fast | writers |
 | `clicked-button` | (opaque object) | any keys | whole frame ≤65536 B | control | writers |
-| `chat-message` | `message` | — | `message`≤2000 | chat | all |
+| `chat-message` | `message` | — | `message`≤2000 | chat | writers |
 | `chat-delete` | `message_id` | — | `message_id`≤64 | control | author or owner |
 | `chat-recall` | `message_id` | — | `message_id`≤64 | control | author, ≤120 s old |
 | `ping` | — | — | — | control | all |
@@ -183,12 +183,17 @@ authorization gate (`session.py` `handle`).
   read-only: the user is in the per-user readonly set (`mod-readonly`) **or**
   `guests_readonly` is on and the sender is anon/gs_ephemeral. A read-only sender
   gets `error {code:"readonly"}`. Write types are `state-update`, `data-update`,
-  `clicked-button`, `poly-token-upsert`, `poly-token-delete`, `poly-lock`, and
-  `doc-edit`.
+  `clicked-button`, `chat-message`, `poly-token-upsert`, `poly-token-delete`,
+  `poly-lock`, and `doc-edit`. Read-only means **no new persisted content**:
+  chat is included because it is kept in the session's chat history and charged
+  to the content budget.
 - **all** — any joined connection, including read-only ones (`poly-cursor`,
-  `doc-cursor`, `chat-message`, `ping`, `session-state`). `chat-delete` / `chat-recall` carry a
-  further in-handler check (author, or owner for delete; author within the recall
-  window for recall) and answer `forbidden` otherwise.
+  `doc-cursor`, `ping`, `session-state`). Cursors are ephemeral presence, never
+  persisted, so a read-only participant can still point at code. `chat-delete` /
+  `chat-recall` are open to read-only senders too (they only remove the sender's
+  own message) but carry a further in-handler check (author, or owner for
+  delete; author within the recall window for recall) and answer `forbidden`
+  otherwise.
 
 `gs_ephemeral` identities can never be owner and cannot create sessions, but by
 default may write (subject to the `guests_readonly` dial).

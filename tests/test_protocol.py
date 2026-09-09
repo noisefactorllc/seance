@@ -270,11 +270,16 @@ def test_authz_sets_exact():
         "state-update",
         "data-update",
         "clicked-button",
+        "chat-message",
         "doc-edit",
         "poly-token-upsert",
         "poly-token-delete",
         "poly-lock",
     }
+    # Ephemeral presence and reads are never gated by readonly.
+    assert WRITE_TYPES.isdisjoint(
+        {"poly-cursor", "doc-cursor", "session-state", "ping", "chat-delete", "chat-recall"}
+    )
     assert MOD_TYPES == {
         "mod-kick",
         "mod-ban",

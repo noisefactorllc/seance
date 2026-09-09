@@ -612,11 +612,18 @@ SERVER_TYPES = frozenset(
     }
 )
 
+# The readonly gate (``session.py`` ``handle``). Read-only means "may not add
+# persisted content": chat belongs here because it is kept in the session's chat
+# history and charged to the content budget. Cursors are deliberately absent —
+# they are ephemeral presence, never persisted, and pointing at code is exactly
+# what a read-only participant is there to do. ``chat-delete`` / ``chat-recall``
+# are absent too: they only remove the sender's own message.
 WRITE_TYPES = frozenset(
     {
         "state-update",
         "data-update",
         "clicked-button",
+        "chat-message",
         "doc-edit",
         "poly-token-upsert",
         "poly-token-delete",
