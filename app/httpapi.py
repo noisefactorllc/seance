@@ -40,6 +40,36 @@ from app.hub import Hub, HubError
 from app.identity import IdentityService, Kind
 from app.ratelimit import KeyedLimiter
 
+# The create body seeds session content directly (state values, poly frame).
+# Python's json accepts the non-standard NaN / Infinity literals and unbounded
+# nesting; both would be persisted and later fan out to browser clients whose
+# JSON.parse (or the server's own deepcopy) cannot handle them. Mirror the
+# WebSocket frame edge: refuse non-finite constants and deep nesting here.
+_MAX_BODY_DEPTH = 64
+
+
+def _reject_constant(name: str):
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
+def _nesting_depth_exceeds(obj, limit: int) -> bool:
+    stack = [(obj, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if depth > limit:
+            return True
+        for child in children:
+            if isinstance(child, (dict, list)):
+                stack.append((child, depth + 1))
+    return False
+
+
 _SERVICE = "seance"
 _HEALTH_PROBE_ID = "______"
 
@@ -217,11 +247,13 @@ class _HttpApi:
         dialect = None
         if raw:
             try:
-                payload = json.loads(raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = json.loads(raw, parse_constant=_reject_constant)
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 return web.json_response({"error": "invalid json"}, status=400)
             if not isinstance(payload, dict):
                 return web.json_response({"error": "body must be a json object"}, status=400)
+            if _nesting_depth_exceeds(payload, _MAX_BODY_DEPTH):
+                return web.json_response({"error": "invalid json"}, status=400)
             snapshot = payload.get("snapshot")
             if "dialect" in payload:
                 dialect = payload["dialect"]
