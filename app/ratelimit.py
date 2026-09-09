@@ -126,6 +126,11 @@ class KeyedLimiter:
     resets once ``window_secs`` have elapsed from that start. The key set is
     bounded to ``max_keys``: on overflow, keys whose window has expired are
     dropped first, then the oldest windows, until the cap is met.
+
+    A key is (re)inserted at the back whenever its window opens, so dict order is
+    window-start order and both of those rules are satisfied by popping from the
+    front. Eviction therefore costs O(dropped), not O(n log n): this runs on the
+    event loop for every pre-upgrade join, and the keys are attacker-chosen.
     """
 
     __slots__ = ("_state", "clock", "limit", "max_keys", "window_secs")
@@ -149,6 +154,9 @@ class KeyedLimiter:
         entry = self._state.get(key)
         if entry is None or now - entry[0] >= self.window_secs:
             window_start, count = now, 0
+            # A window that opens now is the newest: move the key to the back so
+            # dict order keeps matching window-start order.
+            self._state.pop(key, None)
         else:
             window_start, count = entry
         granted = count < self.limit
@@ -160,13 +168,14 @@ class KeyedLimiter:
         return granted
 
     def _evict(self, now: float) -> None:
-        """Bound the key set: drop expired windows, then the oldest, to ``max_keys``."""
-        expired = [k for k, (start, _) in self._state.items() if now - start >= self.window_secs]
-        for key in expired:
-            del self._state[key]
-        overflow = len(self._state) - self.max_keys
-        if overflow <= 0:
-            return
-        oldest = sorted(self._state.items(), key=lambda item: item[1][0])[:overflow]
-        for key, _ in oldest:
+        """Bound the key set: drop expired windows, then the oldest, to ``max_keys``.
+
+        Dict order is window-start order, so every expired window is a prefix and
+        the oldest surviving window is at the front. Each step is a front pop.
+        """
+        while self._state:
+            key = next(iter(self._state))
+            window_start, _ = self._state[key]
+            if now - window_start < self.window_secs and len(self._state) <= self.max_keys:
+                return
             del self._state[key]

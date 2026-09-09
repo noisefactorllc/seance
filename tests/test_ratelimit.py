@@ -220,6 +220,36 @@ def test_keyed_eviction_drops_oldest_when_unexpired(clock):
     assert len(limiter._state) == 2
 
 
+def test_keyed_reopened_window_moves_the_key_to_the_back(clock):
+    """Eviction pops the front, so a fresh window has to become the newest entry."""
+    limiter = KeyedLimiter(limit=5, window_secs=10.0, clock=clock, max_keys=100)
+    limiter.take("a")
+    clock.advance(1.0)
+    limiter.take("b")
+    clock.advance(20.0)
+    limiter.take("a")  # a's window reopens: it is now the newest, not the oldest
+
+    assert list(limiter._state) == ["b", "a"]
+    starts = [start for start, _ in limiter._state.values()]
+    assert starts == sorted(starts)
+
+
+def test_keyed_eviction_keeps_the_newest_windows_under_key_churn(clock):
+    """A burst of fresh keys must not cost more than the keys it drops."""
+    limiter = KeyedLimiter(limit=5, window_secs=1_000.0, clock=clock, max_keys=50)
+    for n in range(50):
+        clock.advance(1.0)
+        limiter.take(f"old-{n}")
+    for n in range(200):
+        clock.advance(1.0)
+        limiter.take(f"new-{n}")
+
+    assert len(limiter._state) == 50
+    assert list(limiter._state) == [f"new-{n}" for n in range(150, 200)]
+    starts = [start for start, _ in limiter._state.values()]
+    assert starts == sorted(starts)
+
+
 # --- default clock wiring ---------------------------------------------------
 
 
