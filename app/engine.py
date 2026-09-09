@@ -256,10 +256,10 @@ class PolyDoc:
         author: str,
         author_seq: int | None,
     ) -> ApplyResult:
-        # A malformed base_rev (bool/non-int) can't be reconciled against any
-        # node version; refuse it as stale rather than crash (protocol gates this,
-        # so this is defense in depth).
-        if not _is_int(base_rev):
+        # A base_rev the server has not reached yet cannot describe any state the
+        # author observed; treating it as current would let a stale client skip
+        # the per-node version check (the lane's only concurrency control).
+        if not _is_int(base_rev) or base_rev > self.rev:
             return ApplyResult(status="rejected", rev=self.rev, applied=[], reason="stale")
         if self._is_duplicate(author, base_rev, author_seq):
             return ApplyResult(status="duplicate", rev=self.rev, applied=[])
@@ -288,7 +288,10 @@ class PolyDoc:
     def delete(
         self, *, base_rev: int, node_id: str, author: str, author_seq: int | None
     ) -> ApplyResult:
-        if not _is_int(base_rev):
+        # A base_rev the server has not reached yet cannot describe any state the
+        # author observed; treating it as current would let a stale client skip
+        # the per-node version check (the lane's only concurrency control).
+        if not _is_int(base_rev) or base_rev > self.rev:
             return ApplyResult(status="rejected", rev=self.rev, applied=[], reason="stale")
         if self._is_duplicate(author, base_rev, author_seq):
             return ApplyResult(status="duplicate", rev=self.rev, applied=[])
