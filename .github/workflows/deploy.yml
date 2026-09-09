@@ -1,0 +1,61 @@
+name: Deploy
+
+# Seance is a public repository, so it holds no registry or server credential
+# and cannot deploy itself. Scaffold is the only builder and deployer: this
+# workflow just tells it which commit to release, using a GitHub App token
+# minted from the one secret this repo does hold.
+#
+# CI is the gate. Scaffold's deploy-seance.yml independently verifies that the
+# commit is reachable from main and that this repo's ci.yml passed for it, so
+# dispatching before CI finishes would simply be refused. Waiting for the ci
+# workflow_run is what makes a push to main deploy on its own.
+#
+# Manual dispatch re-releases the current main head, for retrying a failed
+# deploy without an empty commit.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  trigger-scaffold-deploy:
+    name: Dispatch scaffold deploy-seance
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_branch == 'main' &&
+       (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Mint scaffold GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: Iv23liy6T6BW0BXuZRzx
+          private-key: ${{ secrets.EHSRE_APP_PRIVATE_KEY }}
+          owner: noisefactorllc
+          repositories: scaffold
+
+      - name: Dispatch the CI-verified commit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          gh workflow run deploy-seance.yml \
+            --repo noisefactorllc/scaffold --ref main \
+            -f seance_sha="$SOURCE_SHA"
+          echo "Dispatched scaffold deploy-seance for $SOURCE_SHA"
