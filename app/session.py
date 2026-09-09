@@ -189,7 +189,6 @@ class Session:
                     }
                     for entry in doc._oplog
                 ],
-                "author_seq_highwater": dict(doc._author_seq_highwater),
             }
             for doc in collection._docs.values()
         ]
@@ -553,6 +552,8 @@ class Session:
         conn = self.conns.pop(connection_id, None)
         if conn is None:
             return
+        for doc in self.docs._docs.values():
+            doc.forget_connection(connection_id)
         identity = conn.identity
         still_present = any(c.identity.user_id == identity.user_id for c in self.conns.values())
         if still_present:
@@ -1240,10 +1241,6 @@ class Session:
                 )
                 doc._oplog.append(oplog_entry)
                 doc._oplog_bytes += oplog_entry.size
-            doc._author_seq_highwater = {
-                str(connection_id): int(seq)
-                for connection_id, seq in frozen.get("author_seq_highwater", {}).items()
-            }
         for frame in payload["chat"]:
             session.chat.append(frame)
         session.seq = payload["seq"]

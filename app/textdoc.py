@@ -231,6 +231,17 @@ class TextDoc:
         ))
         return accepted
 
+    def forget_connection(self, connection_id: str) -> None:
+        """Drop the retry cache and dedup high-water mark of a closed connection.
+
+        Connection ids are fresh uuids per socket and never recur, so this state
+        is dead the moment the socket closes; without pruning it grows with
+        every connection that ever edited the document.
+        """
+        self._author_seq_highwater.pop(connection_id, None)
+        for key in [key for key in self._retry_cache if key[0] == connection_id]:
+            del self._retry_cache[key]
+
     def reset(self, text: str) -> dict:
         text = self._coerce_text(text)
         self._validate_doc_text(text)
