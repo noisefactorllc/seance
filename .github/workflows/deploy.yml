@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: deploy-main
@@ -39,7 +40,24 @@ jobs:
        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')) ||
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     steps:
+      - name: Verify the upstream product checks ran
+        id: product-checks
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            if (context.eventName !== 'workflow_run') {
+              core.setOutput('release', 'true');
+              return;
+            }
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              ...context.repo, run_id: context.payload.workflow_run.id, filter: 'latest', per_page: 100
+            });
+            const required = ["test"];
+            const ran = required.every(name => jobs.some(job => job.name === name && job.conclusion === 'success'));
+            core.setOutput('release', String(ran));
+
       - name: Mint scaffold GitHub App token
+        if: steps.product-checks.outputs.release == 'true'
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -49,6 +67,7 @@ jobs:
           repositories: scaffold
 
       - name: Dispatch the CI-verified commit
+        if: steps.product-checks.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}

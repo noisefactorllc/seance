@@ -3,6 +3,19 @@ name: ci
 on:
   pull_request:
   push:
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'doc/**'
+      - '.superpowers/**'
+      - '.claude/**'
+      - '.codex/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      - '.github/copilot-instructions.md'
+      - '.github/CODEOWNERS'
+      - '.github/dependabot.yml'
+      - 'sdk/**/*.md'
     branches: [main]
   workflow_dispatch:
 
@@ -10,7 +23,37 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Classify changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      product: ${{ steps.paths.outputs.product }}
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        id: paths
+        with:
+          script: |
+            // Pushes use the trigger filter. Keep PR checks present so required
+            // checks finish even when all changed files are inert.
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('product', 'true');
+              return;
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo, pull_number: context.issue.number, per_page: 100
+            });
+            const inert = path => /^[^/]+\.md$|^(?:docs|doc|\.superpowers|\.claude|\.codex)\/|^\.github\/(?:ISSUE_TEMPLATE\/|PULL_REQUEST_TEMPLATE[^/]*$|CODEOWNERS$|copilot-instructions\.md$|dependabot\.yml$)/.test(path) || /^sdk\/.*\.md$/.test(path);
+            // The endpoint caps at 3000 files: uncertainty must run the checks.
+            const product = files.length >= 3000 || files.some(file =>
+              !inert(file.filename) || (file.previous_filename && !inert(file.previous_filename)));
+            core.setOutput('product', String(product));
+
   test:
+    needs: changes
+    if: needs.changes.outputs.product == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Harden runner
