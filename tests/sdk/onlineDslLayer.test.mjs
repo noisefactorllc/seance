@@ -105,6 +105,9 @@ function harness(fetchImpl = null) {
         }
     })
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play?code=keep#frag',
         fetch,
@@ -159,6 +162,9 @@ test('share URL generation preserves durable params, strips volatile params, and
 
 test('URL helpers support custom session and volatile param names', () => {
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play?draft=1&room=old&keep=1',
         WebSocket: FakeWebSocket,
@@ -185,6 +191,9 @@ test('hello frame always declares the default dialects list', async () => {
 test('hello frame declares a custom dialect as its own singleton dialects list', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         WebSocket: FakeWebSocket,
@@ -201,6 +210,9 @@ test('hello frame declares a custom dialect as its own singleton dialects list',
 test('hello frame respects an explicit dialects list independent of dialect', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         WebSocket: FakeWebSocket,
@@ -283,6 +295,9 @@ test('takeOnline normalizes an object seed of poly nodes, defaults programText, 
         return { ok: true, status: 201, json: async () => ({ session_id: 'layers1', anon_token: 'anon-token' }) }
     }
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch,
@@ -328,6 +343,9 @@ test('takeOnline normalizes an object seed carrying both docs and poly', async (
         return { ok: true, status: 201, json: async () => ({ session_id: 'mixed1', anon_token: 'anon-token' }) }
     }
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch,
@@ -437,6 +455,9 @@ test('welcome captures the session dialect and exposes it via getSessionDialect'
 test('welcome captures a declared session dialect distinct from the default', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         WebSocket: FakeWebSocket,
@@ -626,6 +647,9 @@ test('goOffline restores editing after a read-only session', async () => {
 test('goOffline clears pending proposal timers before a later join adopts state', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch: async () => {
@@ -664,6 +688,9 @@ test('goOffline clears pending proposal timers before a later join adopts state'
 test('joining a new session closes the prior socket and ignores its delayed close', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch: async () => {
@@ -705,6 +732,9 @@ test('joining a new session closes the prior socket and ignores its delayed clos
 test('socket interruption resubmits local text when the recovery snapshot matches its unapplied base', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch: async () => {
@@ -1235,6 +1265,9 @@ test('a relayed delete removes the node and dotted-id descendants, emitting remo
 test('rapid upserts are paced with the configured minimum spacing between sends', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch: async () => {
@@ -1275,6 +1308,9 @@ test('rapid upserts are paced with the configured minimum spacing between sends'
 test('upsertNode and deleteNode drop while read-only and emit readonly-write', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         WebSocket: FakeWebSocket,
@@ -1315,6 +1351,9 @@ test('upsertNode and deleteNode drop while read-only and emit readonly-write', a
 test('goOffline clears the node queue so pending upserts are not resent after rejoining', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch: async () => {
@@ -1351,6 +1390,9 @@ test('goOffline clears the node queue so pending upserts are not resent after re
 test('socket interruption reconnects, adopts recovery snapshot, and resubmits a pending node write', async () => {
     FakeWebSocket.instances = []
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play',
         fetch: async () => {

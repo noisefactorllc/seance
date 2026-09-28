@@ -95,8 +95,10 @@ test('browser sessionStorage is the default and null/false each opt out without 
     const previous = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage')
     t.after(() => { if (previous) Object.defineProperty(globalThis, 'sessionStorage', previous); else delete globalThis.sessionStorage })
     Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get: () => storage })
-    harness({ anonToken: 'browser-token' })
-    assert.equal(harness().layer.anonToken, 'browser-token')
+    // `undefined` selects the SDK default (browser sessionStorage) despite the
+    // harness' hermetic null default.
+    harness({ anonToken: 'browser-token', anonTokenStorage: undefined })
+    assert.equal(harness({ anonTokenStorage: undefined }).layer.anonToken, 'browser-token')
     let accesses = 0
     Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get: () => { accesses++; throw Error('blocked') } })
     for (const anonTokenStorage of [null, false]) {
@@ -107,7 +109,7 @@ test('browser sessionStorage is the default and null/false each opt out without 
     }
     assert.equal(accesses, 0)
     assert.deepEqual([...storage.values.values()], ['browser-token'])
-    const fallback = harness()
+    const fallback = harness({ anonTokenStorage: undefined })
     t.after(() => fallback.layer.goOffline())
     await join(fallback.layer, fallback.sockets, undefined, 'fallback-token')
     assert.equal(fallback.layer.anonToken, 'fallback-token')

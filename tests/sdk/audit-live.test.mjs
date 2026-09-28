@@ -27,6 +27,9 @@ function mk(extra = {}) {
         constructor(url) { super(url); sockets.push(this) }
     }
     const layer = createOnlineDslLayer({
+        // Hermetic by default: ambient WebStorage (a real sessionStorage) would
+        // otherwise leak anon tokens between layers across tests.
+        anonTokenStorage: null,
         seanceUrl: URL_, fetch: originFetch, WebSocket: Tracking, reconnectBaseMs: 50, reconnectMaxMs: 200, ...extra,
     })
     const events = []

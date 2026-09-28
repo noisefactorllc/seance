@@ -84,6 +84,10 @@ export function harness(extra = {}) {
     const layer = createOnlineDslLayer({
         seanceUrl: 'https://seance.test',
         publicAppUrl: 'https://app.test/play?code=keep#frag',
+        // Hermetic by default: never read or write ambient WebStorage. A real
+        // sessionStorage (Node >= 24, a browser) would otherwise leak anon
+        // tokens between layers, making these tests order-dependent.
+        anonTokenStorage: null,
         fetch,
         WebSocket: FakeWebSocket,
         proposalThrottleMs: 0,

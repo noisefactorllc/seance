@@ -1,0 +1,38 @@
+#!/bin/sh
+# Run the repository's full test suite: pytest, ruff, and the SDK suite
+# (unit, live-server, performance) against an isolated local server.
+set -eu
+cd "$(dirname "$0")/.."
+
+: "${TMPDIR:=/tmp}"
+VENV="$TMPDIR/seance-test-venv"
+PY="$VENV/bin/python"
+
+rm -rf "$VENV"
+
+make_venv() {
+    # The project targets Python 3.14. Prefer a uv-managed interpreter under
+    # TMPDIR; fall back to the system python3 (plus a get-pip bootstrap when
+    # the distro venv ships without ensurepip).
+    if command -v uv >/dev/null 2>&1; then
+        if UV_PYTHON_DOWNLOADS=auto UV_PYTHON_INSTALL_DIR="$TMPDIR/seance-test-py" \
+            uv venv --seed --python 3.14 "$VENV" >&2; then
+            return 0
+        fi
+    fi
+    if python3 -m venv "$VENV" >&2; then
+        return 0
+    fi
+    rm -rf "$VENV"
+    python3 -m venv --without-pip "$VENV"
+    curl -sS https://bootstrap.pypa.io/get-pip.py -o "$TMPDIR/get-pip.py"
+    python3 "$VENV/bin/python" "$TMPDIR/get-pip.py" -q >&2
+}
+
+make_venv
+"$PY" -m pip install -q --require-hashes -r requirements.txt >&2
+"$PY" -m pip install -q -r requirements-dev.txt >&2
+
+"$PY" -m pytest -q >&2
+"$PY" -m ruff check . >&2
+exec "$PY" scripts/test-sdk-ci.py
