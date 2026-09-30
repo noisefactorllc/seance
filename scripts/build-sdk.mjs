@@ -13,6 +13,7 @@ const entry = 'sdk/index.js'
 const sources = [
     'sdk/textOps.js',
     'sdk/peerColors.js',
+    'sdk/images.js',
     'sdk/onlineDslLayer.js',
 ]
 

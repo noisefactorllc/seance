@@ -38,6 +38,7 @@ from app.clientip import resolve_client_ip
 from app.config import Config
 from app.hub import Hub, HubError
 from app.identity import IdentityService, Kind, MintLimited
+from app.images import IMAGE_ID_RE, ImageError, validate_image, validate_images
 from app.ratelimit import KeyedLimiter
 
 # The create body seeds session content directly (state values, poly frame).
@@ -98,6 +99,7 @@ class _HttpApi:
             config.limits.creates_per_ip_hour, _ANON_WINDOW, clock
         )
         self._probe_limiter = KeyedLimiter(config.limits.joins_per_ip_min, _JOIN_WINDOW, clock)
+        self._image_limiter = KeyedLimiter(config.limits.max_images, _JOIN_WINDOW, clock)
         self._startup_iso = datetime.fromtimestamp(clock(), tz=UTC).isoformat()
         self._meta_body = self._read_meta_body()
 
@@ -239,6 +241,7 @@ class _HttpApi:
         raw = await request.read()
         snapshot = None
         dialect = None
+        images = []
         if raw:
             try:
                 payload = json.loads(raw, parse_constant=_reject_constant)
@@ -248,12 +251,21 @@ class _HttpApi:
             if not isinstance(payload, dict):
                 return web.json_response({"error": "body must be a json object"}, status=400)
             snapshot = payload.get("snapshot")
+            try:
+                images = validate_images(payload.get("images", []), self._config.limits)
+            except ImageError as exc:
+                return web.json_response({"error": str(exc)}, status=exc.status)
+            # Images have their own bounded HTTP allowance. They never raise the
+            # existing seed/snapshot text or WebSocket frame budgets.
+            seed_bytes = len(json.dumps(snapshot).encode()) if snapshot is not None else 0
+            if seed_bytes > self._config.limits.max_snapshot_frame:
+                return web.json_response({"error": "snapshot exceeds size limit"}, status=413)
             if "dialect" in payload:
                 dialect = payload["dialect"]
                 if not isinstance(dialect, str) or not protocol.DIALECT_RE.match(dialect):
                     return web.json_response({"error": "invalid dialect"}, status=400)
         try:
-            session_id = await self._hub.create_session(identity, snapshot, dialect)
+            session_id = await self._hub.create_session(identity, snapshot, dialect, images)
         except HubError as exc:
             return web.json_response({"error": exc.detail}, status=exc.status)
         body = {"session_id": session_id}
@@ -263,6 +275,62 @@ class _HttpApi:
         if minted is not None:
             self._set_anon_cookie(response, minted)
         return response
+
+    async def _image_identity(self, request: web.Request, *, write: bool):
+        if not self._anon_credential(request) and not request.cookies.get("SESSION"):
+            raise HubError(403, "join the session before accessing images")
+        identity, minted = await self._identity.resolve(
+            ticket=None, anon_token=self._anon_credential(request),
+            cookie=request.cookies.get("SESSION"), client_ip=self._client_ip(request),
+        )
+        if minted is not None:
+            raise HubError(403, "join the session before accessing images")
+        self._hub.authorize_image(request.match_info["id"], identity, write=write)
+        return identity
+
+    async def upload_image(self, request: web.Request) -> web.StreamResponse:
+        if request.headers.get("Origin") not in self._config.allowed_origins:
+            return web.json_response({"error": "origin not allowed"}, status=403)
+        try:
+            identity = await self._image_identity(request, write=True)
+            if not self._image_limiter.take(identity.user_id):
+                return web.json_response(
+                    {"error": "rate_limited", "retry_after": int(_JOIN_WINDOW)}, status=429
+                )
+            body_limit = ((self._config.limits.max_image_bytes + 2) // 3) * 4 + 1024
+            raw = await request.clone(client_max_size=body_limit).read()
+            try:
+                payload = json.loads(raw, parse_constant=_reject_constant)
+                protocol.validate_json_values(payload, _MAX_BODY_DEPTH)
+            except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+                raise ImageError("invalid json") from exc
+            image = validate_image(payload, self._config.limits)
+            await self._hub.save_image(request.match_info["id"], identity, image)
+            return web.json_response(
+                {"id": image.id, "mimeType": image.mime_type,
+                 "width": image.width, "height": image.height}, status=201
+            )
+        except MintLimited:
+            return web.json_response({"error": "rate_limited"}, status=429)
+        except HubError as exc:
+            return web.json_response({"error": exc.detail}, status=exc.status)
+        except ImageError as exc:
+            return web.json_response({"error": str(exc)}, status=exc.status)
+
+    async def get_image(self, request: web.Request) -> web.StreamResponse:
+        image_id = request.match_info["image_id"]
+        if not IMAGE_ID_RE.fullmatch(image_id):
+            return web.json_response({"error": "unknown image"}, status=404)
+        try:
+            await self._image_identity(request, write=False)
+            image = await self._hub.store.load_image(request.match_info["id"], image_id)
+            if image is None:
+                return web.json_response({"error": "unknown image"}, status=404)
+            return web.Response(body=image.data, content_type=image.mime_type)
+        except MintLimited:
+            return web.json_response({"error": "rate_limited"}, status=429)
+        except HubError as exc:
+            return web.json_response({"error": exc.detail}, status=exc.status)
 
     async def session_probe(self, request: web.Request) -> web.StreamResponse:
         if not self._probe_limiter.take(self._client_ip(request)):
@@ -405,7 +473,11 @@ def build_app(
     layer, which wraps the JSON error normaliser closest to the handlers.
     """
     api = _HttpApi(config, hub, identity, ws_handler, clock, meta_path)
-    app = web.Application(middlewares=[_security_headers_mw, _cors_mw, _error_json_mw])
+    image_body_limit = ((config.limits.max_image_session_bytes + 2) // 3) * 4
+    app = web.Application(
+        middlewares=[_security_headers_mw, _cors_mw, _error_json_mw],
+        client_max_size=image_body_limit + config.limits.max_snapshot_frame + 65536,
+    )
     app[_ALLOWED_ORIGINS_KEY] = config.allowed_origins
 
     app.router.add_get("/up", api.up)
@@ -415,6 +487,8 @@ def build_app(
     app.router.add_get("/v1/me", api.me)
     app.router.add_post("/v1/sessions", api.create_session)
     app.router.add_get("/v1/sessions/{id}", api.session_probe)
+    app.router.add_post("/v1/sessions/{id}/images", api.upload_image)
+    app.router.add_get("/v1/sessions/{id}/images/{image_id}", api.get_image)
     app.router.add_get("/v1/sessions/{id}/ws", ws_handler or api.ws_not_implemented)
     app.router.add_get("/v1/stats", api.stats)
     return app

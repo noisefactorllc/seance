@@ -1,4 +1,5 @@
 import { peerColor } from './peerColors.js'
+import { prepareImage } from './images.js'
 import { applyTextEdit, diffText, rebaseTextWithLocalEdit, transformSelection } from './textOps.js'
 
 const DEFAULT_DOC_ID = 'main'
@@ -237,7 +238,9 @@ class OnlineDslLayer {
                 ...(this.anonToken ? { 'X-Seance-Anon': this.anonToken } : {}),
             },
             credentials: 'include',
-            body: JSON.stringify({ snapshot, dialect: this.options.dialect }),
+            body: JSON.stringify({ snapshot, dialect: this.options.dialect,
+                ...(seed?.images?.length ? { images: seed.images } : {}),
+            }),
         })
         if (generation !== this._connectionGeneration) throw new Error('connection superseded')
         if (!response.ok) {
@@ -247,6 +250,47 @@ class OnlineDslLayer {
         if (generation !== this._connectionGeneration) throw new Error('connection superseded')
         this._rememberAnonToken(body.anon_token)
         return this.connect(body.session_id)
+    }
+
+    async uploadImage(blob) {
+        const sessionId = this.sessionId
+        const generation = this._connectionGeneration
+        if (!sessionId || this._intentionalDisconnect || this.readonly) throw new Error('Join a writable session before uploading an image')
+        const image = await prepareImage(blob)
+        this._checkImageSession(sessionId, generation)
+        const response = await this.fetch(`${this._httpBaseUrl()}/v1/sessions/${encodeURIComponent(sessionId)}/images`, {
+            method: 'POST', credentials: 'include',
+            headers: { 'Content-Type': 'application/json', ...(this.anonToken ? { 'X-Seance-Anon': this.anonToken } : {}) },
+            body: JSON.stringify(image),
+        })
+        this._checkImageSession(sessionId, generation)
+        if (!response.ok) throw new Error(`Image upload failed (${response.status})`)
+        const result = await response.json()
+        this._checkImageSession(sessionId, generation)
+        if (result.id !== image.id) throw new Error('Image upload returned a different image')
+        return image.id
+    }
+
+    async getImage(imageId) {
+        if (typeof imageId !== 'string' || !/^[a-f0-9]{64}$/.test(imageId)) throw new Error('Invalid image id')
+        const sessionId = this.sessionId
+        const generation = this._connectionGeneration
+        this._checkImageSession(sessionId, generation)
+        const response = await this.fetch(`${this._httpBaseUrl()}/v1/sessions/${encodeURIComponent(sessionId)}/images/${imageId}`, {
+            method: 'GET', credentials: 'include',
+            headers: { ...(this.anonToken ? { 'X-Seance-Anon': this.anonToken } : {}) },
+        })
+        this._checkImageSession(sessionId, generation)
+        if (!response.ok) throw new Error(`Image download failed (${response.status})`)
+        const blob = await response.blob()
+        const image = await prepareImage(blob)
+        this._checkImageSession(sessionId, generation)
+        if (image.id !== imageId) throw new Error('Image bytes do not match the requested image')
+        return blob
+    }
+
+    _checkImageSession(sessionId, generation) {
+        if (!sessionId || this._intentionalDisconnect || this.sessionId !== sessionId || this._connectionGeneration !== generation) throw new Error('Image transfer superseded by a session change')
     }
 
     joinSession(sessionId) {

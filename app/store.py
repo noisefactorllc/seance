@@ -14,15 +14,33 @@ All SQL is parameterized. On open the DB file is restricted to mode ``0600``.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
+from functools import wraps
 
 import aiosqlite
 
 from app.audit import AuditEvent, log_audit
+from app.images import ImageAsset, ImageError
 
 _SCHEMA_VERSION = "4"
+
+
+def _serialize_write(method):
+    # One SQLite connection owns one transaction. Keep another writer's commit
+    # from publishing a session while its image batch can still fail.
+    @wraps(method)
+    async def serialized(self, *args, **kwargs):
+        async with self._write_lock:
+            try:
+                return await method(self, *args, **kwargs)
+            except BaseException:
+                if not self._closed:
+                    await self._db.rollback()
+                raise
+    return serialized
 
 
 def _harden_wal_sidecars(path: str) -> None:
@@ -95,6 +113,10 @@ CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, session_id TEXT,
   actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
+CREATE TABLE IF NOT EXISTS images (
+  session_id TEXT NOT NULL, id TEXT NOT NULL, mime_type TEXT NOT NULL,
+  width INTEGER NOT NULL, height INTEGER NOT NULL, data BLOB NOT NULL,
+  PRIMARY KEY (session_id, id));
 """
 
     def __init__(
@@ -107,6 +129,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
         self._path = path
         self._lock_fd = lock_fd
         self._closed = False
+        self._write_lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, path: str) -> Store:
@@ -175,7 +198,10 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             raise
         return cls(db, path, lock_fd)
 
-    async def save_session(self, session_id: str, payload: dict) -> None:
+    @_serialize_write
+    async def save_session(
+        self, session_id: str, payload: dict, images: list[ImageAsset] | None = None
+    ) -> None:
         """Insert or replace the whole session row from ``payload``.
 
         JSON-encodes the structured columns; stores scalars verbatim. A missing
@@ -205,6 +231,13 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             values,
         )
+        if images:
+            await self._db.executemany(
+                "INSERT INTO images (session_id, id, mime_type, width, height, data) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(session_id, image.id, image.mime_type, image.width, image.height, image.data)
+                 for image in images],
+            )
         await self._db.commit()
         _harden_wal_sidecars(self._path)
 
@@ -242,15 +275,44 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             row = await cursor.fetchone()
         return int(row[0])
 
+    @_serialize_write
     async def delete_session(self, session_id: str) -> None:
         """Delete the session and its per-session bans (a no-op if absent).
 
         Audit rows are intentionally retained as the service audit trail.
         """
         await self._db.execute("DELETE FROM bans WHERE session_id = ?", (session_id,))
+        await self._db.execute("DELETE FROM images WHERE session_id = ?", (session_id,))
         await self._db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         await self._db.commit()
         _harden_wal_sidecars(self._path)
+
+    @_serialize_write
+    async def save_image(
+        self, session_id: str, image: ImageAsset, max_bytes: int, max_count: int
+    ) -> None:
+        # The budget check and insertion are one SQLite statement, so simultaneous
+        # uploads cannot both consume the same remaining allowance.
+        await self._db.execute(
+            "INSERT OR IGNORE INTO images (session_id, id, mime_type, width, height, data) "
+            "SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?) "
+            "AND (SELECT COALESCE(SUM(length(data)), 0) FROM images WHERE session_id = ?) "
+            "+ ? <= ? AND (SELECT COUNT(*) FROM images WHERE session_id = ?) < ?",
+            (session_id, image.id, image.mime_type, image.width, image.height, image.data,
+             session_id, session_id, len(image.data), max_bytes, session_id, max_count),
+        )
+        await self._db.commit()
+        if await self.load_image(session_id, image.id) is None:
+            raise ImageError("session image limit exceeded", 413)
+        _harden_wal_sidecars(self._path)
+
+    async def load_image(self, session_id: str, image_id: str) -> ImageAsset | None:
+        async with self._db.execute(
+            "SELECT mime_type, width, height, data FROM images WHERE session_id = ? AND id = ?",
+            (session_id, image_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else ImageAsset(image_id, row[0], row[1], row[2], row[3])
 
     async def list_frozen_older_than(self, ts: int) -> list[str]:
         """Return sorted ids of frozen sessions whose ``frozen_at`` is strictly < ``ts``.
@@ -281,6 +343,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             rows = await cursor.fetchall()
         return [row[0] for row in rows]
 
+    @_serialize_write
     async def add_ban(self, session_id: str, user_id: str, by: str, ts: int) -> None:
         """Record (or refresh) a ban for ``user_id`` in ``session_id`` (idempotent)."""
         await self._db.execute(
@@ -291,6 +354,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
         await self._db.commit()
         _harden_wal_sidecars(self._path)
 
+    @_serialize_write
     async def remove_ban(self, session_id: str, user_id: str) -> None:
         """Remove ``user_id``'s ban from ``session_id`` (a no-op if absent)."""
         await self._db.execute(
@@ -308,6 +372,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             rows = await cursor.fetchall()
         return {row[0] for row in rows}
 
+    @_serialize_write
     async def audit(
         self,
         ts: int,
@@ -336,6 +401,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
             )
         )
 
+    @_serialize_write
     async def close(self) -> None:
         """Commit and close the connection (idempotent; a second call is a no-op)."""
         if self._closed:

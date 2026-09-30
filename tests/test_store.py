@@ -4,6 +4,7 @@ All databases are created under ``tmp_path``; the audit stdout line is captured
 via ``caplog`` on the ``seance.audit`` logger. No network, no sleeping.
 """
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -13,6 +14,7 @@ import sqlite3
 import pytest
 
 from app.audit import AuditEvent, log_audit
+from app.images import ImageAsset
 from app.store import Store
 
 
@@ -71,13 +73,13 @@ async def test_open_creates_schema_and_wal(tmp_path):
         async with store._db.execute("PRAGMA journal_mode") as cur:
             row = await cur.fetchone()
         assert row[0] == "wal"
-        # All four schema tables exist (ignoring SQLite internals).
+        # All schema tables exist (ignoring SQLite internals).
         async with store._db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ) as cur:
             names = [r[0] for r in await cur.fetchall()]
-        assert names == ["audit", "bans", "meta", "sessions"]
+        assert names == ["audit", "bans", "images", "meta", "sessions"]
     finally:
         await store.close()
 
@@ -91,6 +93,62 @@ async def test_schema_version_row_present(tmp_path):
             row = await cur.fetchone()
         assert row is not None
         assert row[0] == "4"
+    finally:
+        await store.close()
+
+
+async def test_failed_image_seed_cannot_commit_during_another_write(tmp_path, monkeypatch):
+    store = await Store.open(str(tmp_path / "test.db"))
+    inserting = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def fail_images(*args, **kwargs):
+        inserting.set()
+        await resume.wait()
+        raise sqlite3.IntegrityError("image storage failed")
+
+    monkeypatch.setattr(store._db, "executemany", fail_images)
+    image = ImageAsset("a" * 64, "image/png", 1, 1, b"image")
+    seed = asyncio.create_task(store.save_session("failed", _sample_payload(), [image]))
+    try:
+        await inserting.wait()
+        audit = asyncio.create_task(store.audit(1, "other", "alice", "join", None, {}))
+        await asyncio.wait({audit}, timeout=0.05)
+        resume.set()
+        with pytest.raises(sqlite3.IntegrityError):
+            await seed
+        await audit
+        assert await store.load_session("failed") is None
+        async with store._db.execute("SELECT COUNT(*) FROM audit") as cursor:
+            assert (await cursor.fetchone())[0] == 1
+    finally:
+        resume.set()
+        await store.close()
+
+
+async def test_cancelled_image_seed_rolls_back_before_the_next_write(tmp_path, monkeypatch):
+    store = await Store.open(str(tmp_path / "test.db"))
+    inserted = asyncio.Event()
+    execute = store._db.execute
+
+    async def pause_after_insert(sql, *args):
+        cursor = await execute(sql, *args)
+        if sql.startswith("INSERT OR REPLACE INTO sessions"):
+            inserted.set()
+            await asyncio.Event().wait()
+        return cursor
+
+    monkeypatch.setattr(store._db, "execute", pause_after_insert)
+    image = ImageAsset("a" * 64, "image/png", 1, 1, b"image")
+    seed = asyncio.create_task(store.save_session("cancelled", _sample_payload(), [image]))
+    try:
+        await inserted.wait()
+        seed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await seed
+        monkeypatch.setattr(store._db, "execute", execute)
+        await store.audit(1, "other", "alice", "join", None, {})
+        assert await store.load_session("cancelled") is None
     finally:
         await store.close()
 

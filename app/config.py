@@ -74,6 +74,9 @@ class Limits:
     max_doc_oplog: int = 500
     max_doc_oplog_bytes: int = 1_048_576
     max_session_bytes: int = 8_388_608
+    max_image_bytes: int = 8_388_608
+    max_image_session_bytes: int = 33_554_432
+    max_images: int = 32
     max_value_bytes: int = 8192
     max_state_id_len: int = 128
     chat_history: int = 200

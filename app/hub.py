@@ -40,6 +40,7 @@ from app.audit import AuditEvent
 from app.config import Config
 from app.engine import EngineLimit
 from app.identity import Identity, Kind
+from app.images import ImageAsset
 from app.ratelimit import KeyedLimiter
 from app.session import ConnLike, JoinRefused, Session
 from app.store import Store
@@ -185,7 +186,8 @@ class Hub:
             return candidate
 
     async def create_session(
-        self, identity: Identity, snapshot: dict | None = None, dialect: str | None = None
+        self, identity: Identity, snapshot: dict | None = None, dialect: str | None = None,
+        images: list[ImageAsset] | None = None,
     ) -> str:
         """Authorize, mint, seed, and persist a new session (frozen); return its id."""
         await self._drain_pending()
@@ -219,8 +221,31 @@ class Hub:
                 raise HubError(413, "session snapshot exceeds aggregate content limit")
             payload = session.freeze_snapshot()
             payload["frozen_at"] = int(self.clock())
-            await self.store.save_session(session_id, payload)
+            if images:
+                await self.store.save_session(session_id, payload, images)
+            else:
+                await self.store.save_session(session_id, payload)
             return session_id
+
+    def authorize_image(self, session_id: str, identity: Identity, *, write: bool) -> None:
+        session = self.live.get(session_id)
+        if session is None or identity.user_id in session.bans or not any(
+            conn.identity.user_id == identity.user_id for conn in session.conns.values()
+        ):
+            raise HubError(403, "join the session before accessing images")
+        if write and session._is_readonly(identity):
+            raise HubError(403, "session is read-only")
+
+    async def save_image(self, session_id: str, identity: Identity, image: ImageAsset) -> None:
+        lock = self._acquire_lock_ref(session_id)
+        try:
+            async with lock:
+                self.authorize_image(session_id, identity, write=True)
+                await self.store.save_image(
+                    session_id, image, self.limits.max_image_session_bytes, self.limits.max_images
+                )
+        finally:
+            self._release_lock_ref(session_id)
 
     def _apply_snapshot(self, session: Session, snapshot: dict) -> None:
         """Seed a fresh session's engine lanes from an optional creator snapshot.

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createOnlineDslLayer } from '../../sdk/index.js'
+import { createOnlineDslLayer, prepareImage } from '../../sdk/index.js'
 import { FakeEditor, sleep } from './audit-harness.mjs'
 
 const URL_ = process.env.SEANCE_LIVE_URL || 'http://127.0.0.1:8765'
@@ -55,6 +55,27 @@ async function serverDocs(sessionId, anonToken) {
 
 const DOC = (text, id = 'main', dflt = true) => ({ id, title: 'P', kind: 'noisemaker-dsl', text, default: dflt })
 let SHARED_TOKEN = null   // one anon identity reused across tests (anon mints are capped per IP)
+
+test('live image assets reach independent late joiners and survive creator departure', { skip, timeout: 15000 }, async (t) => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XkAAAAASUVORK5CYII=', 'base64')
+    const image = await prepareImage(new Blob([png], { type: 'image/png' }))
+    const { layer: host } = mk()
+    const { layer: guest } = mk()
+    const { layer: late } = mk()
+    t.after(() => { host.goOffline(); guest.goOffline(); late.goOffline() })
+    const text = `search synth\nmedia(url: "image:${image.id}").write(o0)\nrender(o0)`
+    await host.takeOnline({ docs: [DOC(text)], images: [image] })
+    const sessionId = host.getSessionId()
+    await guest.joinSession(sessionId)
+    assert.equal(guest.docs.get('main').text, text)
+    assert.deepEqual(Buffer.from(await (await guest.getImage(image.id)).arrayBuffer()), png)
+    const gif = Buffer.from('R0lGODdhAwACAIEAAL5QFAAAAAAAAAAAACwAAAAAAwACAAAIBgABCBwYEAA7', 'base64')
+    const replacementId = await guest.uploadImage(new Blob([gif], { type: 'image/gif' }))
+    host.goOffline()
+    await late.joinSession(sessionId)
+    assert.deepEqual(Buffer.from(await (await late.getImage(image.id)).arrayBuffer()), png)
+    assert.deepEqual(Buffer.from(await (await late.getImage(replacementId)).arrayBuffer()), gif)
+})
 
 test('live-0 server is up', { skip }, async () => {
     const r = await fetch(`${URL_}/up`)

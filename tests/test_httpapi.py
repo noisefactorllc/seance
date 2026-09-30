@@ -7,6 +7,8 @@ wrapped around a real :class:`app.hub.Hub` over a ``tmp_path`` store and a real
 :class:`tests.conftest.FakeClock`; no sleeping, no external network.
 """
 
+import base64
+import hashlib
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -27,6 +29,12 @@ from tests.conftest import FakeConn
 ALLOWED = "http://allowed.test"
 EVIL = "http://evil.test"
 MEMBER_UUID = "0f9b2d7e-1111-2222-3333-444455556666"
+
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XkAAAAASUVORK5CYII="
+)
+IMAGE_ID = hashlib.sha256(PNG).hexdigest()
+IMAGE = {"id": IMAGE_ID, "dataUrl": "data:image/png;base64," + base64.b64encode(PNG).decode()}
 
 
 def _env(**overrides: str) -> dict[str, str]:
@@ -613,3 +621,124 @@ async def test_create_rejects_overflowing_json_numbers_before_persistence(app_fa
     )
     assert response.status == 400
     assert await ctx.store.count_sessions() == 0
+
+
+async def image_session(ctx, *, images=None):
+    minted = await ctx.client.post("/v1/anon", headers={"Origin": ALLOWED})
+    token = (await minted.json())["anon_token"]
+    identity = ctx.identity.verify_anon(token)
+    headers = {"Origin": ALLOWED, "X-Seance-Anon": token}
+    response = await ctx.client.post(
+        "/v1/sessions", headers=headers,
+        json={"images": [IMAGE] if images is None else images},
+    )
+    assert response.status == 201
+    session_id = (await response.json())["session_id"]
+    conn = FakeConn(identity)
+    session = await ctx.hub.connect(session_id, conn)
+    return session_id, headers, conn, session
+
+
+async def test_session_images_preserve_bytes_across_freeze_without_websocket_payload(app_factory):
+    ctx = await app_factory()
+    session_id, headers, conn, session = await image_session(ctx)
+    path = f"/v1/sessions/{session_id}/images/{IMAGE_ID}"
+    response = await ctx.client.get(path, headers=headers)
+    assert response.status == 200
+    assert response.content_type == "image/png"
+    assert await response.read() == PNG
+    assert "data:image" not in str(conn.sent)
+    ctx.hub.disconnect(session, conn.connection_id)
+    await ctx.hub._freeze(session_id)
+    replacement = FakeConn(conn.identity)
+    session = await ctx.hub.connect(session_id, replacement)
+    restored = await ctx.client.get(path, headers=headers)
+    assert await restored.read() == PNG
+    ctx.hub.disconnect(session, replacement.connection_id)
+    await ctx.hub._freeze(session_id)
+    await ctx.store.delete_session(session_id)
+    assert await ctx.store.load_image(session_id, IMAGE_ID) is None
+
+
+@pytest.mark.parametrize("asset", [
+    {"id": IMAGE_ID, "dataUrl": "data:video/mp4;base64,AAAA"},
+    {"id": "0" * 64, "dataUrl": IMAGE["dataUrl"]},
+    {"id": IMAGE_ID, "dataUrl": "data:image/png;base64,AAAA"},
+    {"id": IMAGE_ID, "dataUrl": "https://example.test/image.png"},
+])
+async def test_invalid_image_seed_never_creates_session(app_factory, asset):
+    ctx = await app_factory()
+    response = await ctx.client.post(
+        "/v1/sessions", headers={"Origin": ALLOWED}, json={"images": [asset]}
+    )
+    assert response.status == 400
+    assert await ctx.store.count_sessions() == 0
+
+
+async def test_image_routes_require_membership_and_honor_readonly(app_factory):
+    ctx = await app_factory()
+    session_id, headers, conn, session = await image_session(ctx, images=[])
+    path = f"/v1/sessions/{session_id}/images"
+    assert (await ctx.client.post(path, headers=headers, json=IMAGE)).status == 201
+    outsider, token = ctx.identity.mint_anon()
+    stranger = {"Origin": ALLOWED, "X-Seance-Anon": token}
+    assert (await ctx.client.get(f"{path}/{IMAGE_ID}", headers=stranger)).status == 403
+    assert (await ctx.client.post(path, headers=stranger, json=IMAGE)).status == 403
+    assert (await ctx.client.get(f"{path}/{IMAGE_ID}")).status == 403
+    session.readonly_users.add(conn.identity.user_id)
+    assert (await ctx.client.post(path, headers=headers, json=IMAGE)).status == 403
+    assert (await ctx.client.get(f"{path}/{IMAGE_ID}", headers=headers)).status == 200
+    assert (await ctx.client.post(path, headers={"X-Seance-Anon": headers["X-Seance-Anon"]},
+                                  json=IMAGE)).status == 403
+
+
+async def test_image_budget_is_deduplicated_and_session_scoped(app_factory):
+    ctx = await app_factory(
+        SEANCE_LIMIT_MAX_IMAGE_BYTES="100", SEANCE_LIMIT_MAX_IMAGE_SESSION_BYTES="70"
+    )
+    session_id, headers, conn, session = await image_session(ctx)
+    path = f"/v1/sessions/{session_id}/images"
+    assert (await ctx.client.post(path, headers=headers, json=IMAGE)).status == 201
+    # A second valid PNG with changed IDAT bytes must consume its own budget.
+    different = PNG[:45] + bytes([PNG[45] ^ 1]) + PNG[46:]
+    asset = {"id": hashlib.sha256(different).hexdigest(),
+             "dataUrl": "data:image/png;base64," + base64.b64encode(different).decode()}
+    assert (await ctx.client.post(path, headers=headers, json=asset)).status == 413
+    # A known digest in another session is never a cross-session asset read.
+    other_id, other_headers, _, _ = await image_session(ctx, images=[])
+    assert (await ctx.client.get(f"/v1/sessions/{other_id}/images/{IMAGE_ID}",
+                                headers=other_headers)).status == 404
+
+
+async def test_large_image_seed_does_not_expand_websocket_snapshot(app_factory):
+    ctx = await app_factory()
+    data = PNG + b"\0" * 1_100_000
+    image = {"id": hashlib.sha256(data).hexdigest(),
+             "dataUrl": "data:image/png;base64," + base64.b64encode(data).decode()}
+    session_id, headers, conn, _ = await image_session(ctx, images=[image])
+    response = await ctx.client.get(
+        f"/v1/sessions/{session_id}/images/{image['id']}", headers=headers
+    )
+    assert await response.read() == data
+    assert len(str(conn.sent)) < 5000
+
+
+async def test_failed_image_seed_storage_rolls_back_session(app_factory):
+    ctx = await app_factory()
+    await ctx.store._db.execute(
+        "CREATE TRIGGER reject_image BEFORE INSERT ON images "
+        "BEGIN SELECT RAISE(FAIL, 'test image storage failure'); END"
+    )
+    response = await ctx.client.post(
+        "/v1/sessions", headers={"Origin": ALLOWED}, json={"images": [IMAGE]}
+    )
+    assert response.status == 500
+    assert await ctx.store.count_sessions() == 0
+
+
+async def test_image_upload_rate_is_bounded_even_for_duplicate_bytes(app_factory):
+    ctx = await app_factory(SEANCE_LIMIT_MAX_IMAGES="2")
+    session_id, headers, _, _ = await image_session(ctx, images=[])
+    statuses = [(await ctx.client.post(f"/v1/sessions/{session_id}/images",
+                                      headers=headers, json=IMAGE)).status for _ in range(3)]
+    assert statuses == [201, 201, 429]

@@ -1,4 +1,5 @@
 export { createOnlineDslLayer } from './onlineDslLayer.js'
+export { prepareImage } from './images.js'
 export {
     applyTextEdit,
     diffText,
