@@ -1475,5 +1475,7 @@ test('server URL has trailing slashes removed in linear time', () => {
     const hostile = `https://seance.test${'/'.repeat(200000)}x`
     const started = Date.now()
     assert.equal(make(hostile)._httpBaseUrl(), hostile)
-    assert.ok(Date.now() - started < 1000)
+    // The backtracking regex this replaced ran for minutes on this input; the
+    // bound only needs to separate linear from quadratic, so leave CI headroom.
+    assert.ok(Date.now() - started < 10000)
 })
