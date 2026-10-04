@@ -1467,3 +1467,13 @@ test('socket interruption reconnects, adopts recovery snapshot, and resubmits a 
     assert.equal(FakeWebSocket.instances[0].sent.filter((msg) => msg.type === 'poly-token-upsert').length, 1)
     assert.equal(layer.getStatus(), 'online')
 })
+
+test('server URL has trailing slashes removed in linear time', () => {
+    const make = (seanceUrl) => createOnlineDslLayer({ anonTokenStorage: null, seanceUrl })
+    assert.equal(make('https://seance.test///')._httpBaseUrl(), 'https://seance.test')
+    assert.equal(make('https://seance.test/base')._httpBaseUrl(), 'https://seance.test/base')
+    const hostile = `https://seance.test${'/'.repeat(200000)}x`
+    const started = Date.now()
+    assert.equal(make(hostile)._httpBaseUrl(), hostile)
+    assert.ok(Date.now() - started < 1000)
+})

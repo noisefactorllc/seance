@@ -1548,5 +1548,8 @@ function urlFrom(locationLike) {
 }
 
 function stripTrailingSlash(value) {
-    return String(value || '').replace(/\/+$/, '')
+    const text = String(value || '')
+    let end = text.length
+    while (end > 0 && text[end - 1] === '/') end--
+    return text.slice(0, end)
 }
