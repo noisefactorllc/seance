@@ -452,3 +452,55 @@ test('SDK-16 a non-JSON frame during the handshake rejects connect() instead of 
     await tick()
     assert.equal(layer.getStatus(), 'offline')
 })
+
+// A page busy past the server's 10 s hello deadline while it boots is not a refused join.
+function missHelloDeadline(socket) {
+    socket.open()
+    socket.receive({ type: 'error', code: 'bad_frame', detail: 'hello timeout' })
+    socket.closeWith(4400)
+}
+
+test('a join closed for a missed hello deadline is tried again on a new socket', async (t) => {
+    const { layer, sockets } = harness()
+    t.after(() => layer.goOffline())
+    const pending = layer.connect('abc123')
+    missHelloDeadline(sockets.at(-1))
+    await tick(); await tick()
+    assert.equal(sockets.length, 2)
+    await finishHandshake(pending, sockets.at(-1), [])
+    assert.equal(layer.getStatus(), 'online')
+})
+
+test('hello deadline retries stop after two, and other refusals are never retried', async (t) => {
+    const { layer, sockets } = harness()
+    t.after(() => layer.goOffline())
+    const outcome = layer.connect('abc123').then(() => null, (error) => error)
+    for (let attempt = 0; attempt < 3; attempt++) {
+        missHelloDeadline(sockets.at(-1))
+        await tick(); await tick()
+    }
+    assert.match(String((await outcome)?.message), /hello timeout/)
+    assert.equal(sockets.length, 3)
+    const refused = layer.connect('def456')
+    const socket = sockets.at(-1)
+    socket.open()
+    socket.receive({ type: 'error', code: 'forbidden', detail: 'banned' })
+    socket.closeWith(4403)
+    await assert.rejects(refused, /banned/)
+    await tick()
+    assert.equal(sockets.length, 4)
+})
+
+test('leaving during a hello deadline retry ends the join', async (t) => {
+    const { layer, sockets } = harness()
+    t.after(() => layer.goOffline())
+    const pending = layer.connect('abc123')
+    const first = sockets.at(-1)
+    first.open()
+    first.receive({ type: 'error', code: 'bad_frame', detail: 'hello timeout' })
+    layer.goOffline()
+    first.closeWith(4400)
+    await assert.rejects(pending)
+    await tick()
+    assert.equal(sockets.length, 1)
+})

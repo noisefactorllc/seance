@@ -315,6 +315,12 @@ CREATE TABLE IF NOT EXISTS images (
              int(time.time()) if now is None else now,
              session_id, session_id, len(image.data), max_bytes, session_id, max_count),
         )
+        # Sending bytes the session already holds marks them as fresh again, so a
+        # re-upload ahead of the edit that refers to them again is not freed first.
+        await self._db.execute(
+            "UPDATE images SET created_at = MAX(created_at, ?) WHERE session_id = ? AND id = ?",
+            (int(time.time()) if now is None else now, session_id, image.id),
+        )
         await self._db.commit()
         if await self.load_image(session_id, image.id) is None:
             raise ImageError("session image limit exceeded", 413)

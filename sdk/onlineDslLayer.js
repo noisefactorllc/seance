@@ -94,6 +94,19 @@ class OnlineDslLayer {
     }
 
     connect(sessionId = this.sessionId, options = {}) {
+        const leaves = this._leaves
+        const attempt = (tries) => this._connectOnce(sessionId, options).catch((error) => {
+            // A page busy past the server's hello deadline (still compiling shaders
+            // while it boots, say) has its socket closed before its hello is read.
+            // That says nothing about the session, so the same join is tried again.
+            if (tries >= HELLO_TIMEOUT_RETRIES || !isHelloTimeout(error) || leaves !== this._leaves ||
+                this.sessionId !== sessionId) throw error
+            return attempt(tries + 1)
+        })
+        return attempt(0)
+    }
+
+    _connectOnce(sessionId, options) {
         if (!sessionId) {
             throw new Error('connect requires a session id')
         }
@@ -212,6 +225,7 @@ class OnlineDslLayer {
 
     disconnect() {
         this._connectionGeneration += 1
+        this._leaves = (this._leaves || 0) + 1
         this._intentionalDisconnect = true
         clearTimeout(this._reconnectTimer)
         this._reconnectTimer = null
@@ -1450,6 +1464,12 @@ function chunkEditText(text) {
         else high = end - 1
     }
     return candidate.slice(0, low)
+}
+
+const HELLO_TIMEOUT_RETRIES = 2
+
+function isHelloTimeout(error) {
+    return error?.code === 'bad_frame' && /hello timeout/i.test(String(error?.message || ''))
 }
 
 function protocolError(msg) {

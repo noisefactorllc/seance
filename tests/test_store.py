@@ -623,3 +623,16 @@ async def test_prune_images_spares_recent_and_kept_images(tmp_path):
             True, False, True]
     finally:
         await store.close()
+
+
+async def test_resending_held_image_bytes_marks_them_fresh(tmp_path):
+    store = await Store.open(str(tmp_path / "fresh.db"))
+    try:
+        await store.save_session("s", _sample_payload())
+        image = ImageAsset("a" * 64, "image/png", 1, 1, b"a")
+        await store.save_image("s", image, 1 << 20, 8, now=10)
+        await store.save_image("s", image, 1 << 20, 8, now=50)
+        assert await store.prune_images("s", set(), 20) == 0
+        assert await store.prune_images("s", set(), 60) == 1
+    finally:
+        await store.close()
