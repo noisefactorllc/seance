@@ -92,7 +92,7 @@ async def test_schema_version_row_present(tmp_path):
         ) as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row[0] == "4"
+        assert row[0] == "5"
     finally:
         await store.close()
 
@@ -589,3 +589,37 @@ async def test_v3_migration_preserves_legacy_sessions_from_unclaimed_retention(t
         assert await migrated.list_unclaimed_older_than(cutoff) == ["fresh"]
     finally:
         await migrated.close()
+
+
+async def test_v4_migration_keeps_images_and_dates_them_old_enough_to_free(tmp_path):
+    db_path = tmp_path / "legacy-images.db"
+    store = await Store.open(str(db_path))
+    await store.save_session("legacy", _sample_payload())
+    image = ImageAsset("a" * 64, "image/png", 1, 1, b"png")
+    await store.save_image("legacy", image, 1 << 20, 8)
+    await store.close()
+    with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE images DROP COLUMN created_at")
+        db.execute("UPDATE meta SET v = '4' WHERE k = 'schema_version'")
+    migrated = await Store.open(str(db_path))
+    try:
+        assert (await migrated.load_image("legacy", "a" * 64)).data == b"png"
+        assert await migrated.prune_images("legacy", {"a" * 64}, 1) == 0
+        assert await migrated.prune_images("legacy", set(), 1) == 1
+        assert await migrated.load_image("legacy", "a" * 64) is None
+    finally:
+        await migrated.close()
+
+
+async def test_prune_images_spares_recent_and_kept_images(tmp_path):
+    store = await Store.open(str(tmp_path / "prune.db"))
+    try:
+        await store.save_session("s", _sample_payload())
+        for name, at in (("a", 10), ("b", 10), ("c", 50)):
+            await store.save_image("s", ImageAsset(name * 64, "image/png", 1, 1, name.encode()),
+                                   1 << 20, 8, now=at)
+        assert await store.prune_images("s", {"a" * 64}, 20) == 1
+        assert [await store.load_image("s", name * 64) is not None for name in "abc"] == [
+            True, False, True]
+    finally:
+        await store.close()

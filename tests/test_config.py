@@ -55,6 +55,8 @@ _EXPECTED_LIMITS = {
     "max_image_bytes": (8_388_608, int),
     "max_image_session_bytes": (33_554_432, int),
     "max_images": (32, int),
+    "image_uploads_per_minute": (240, int),
+    "image_prune_grace": (600.0, float),
     "max_value_bytes": (8192, int),
     "max_state_id_len": (128, int),
     "chat_history": (200, int),

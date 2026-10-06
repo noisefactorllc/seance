@@ -18,6 +18,7 @@ import asyncio
 import fcntl
 import json
 import os
+import time
 from functools import wraps
 
 import aiosqlite
@@ -25,7 +26,7 @@ import aiosqlite
 from app.audit import AuditEvent, log_audit
 from app.images import ImageAsset, ImageError
 
-_SCHEMA_VERSION = "4"
+_SCHEMA_VERSION = "5"
 
 
 def _serialize_write(method):
@@ -116,6 +117,7 @@ CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
 CREATE TABLE IF NOT EXISTS images (
   session_id TEXT NOT NULL, id TEXT NOT NULL, mime_type TEXT NOT NULL,
   width INTEGER NOT NULL, height INTEGER NOT NULL, data BLOB NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (session_id, id));
 """
 
@@ -169,6 +171,7 @@ CREATE TABLE IF NOT EXISTS images (
                 await _migrate_v1_to_v2(db)
                 await _migrate_v2_to_v3(db)
                 await _migrate_v3_to_v4(db)
+                await _migrate_v4_to_v5(db)
                 await db.execute(
                     "UPDATE meta SET v = ? WHERE k = ?", (_SCHEMA_VERSION, "schema_version")
                 )
@@ -176,12 +179,20 @@ CREATE TABLE IF NOT EXISTS images (
             elif row[0] == "2":
                 await _migrate_v2_to_v3(db)
                 await _migrate_v3_to_v4(db)
+                await _migrate_v4_to_v5(db)
                 await db.execute(
                     "UPDATE meta SET v = ? WHERE k = ?", (_SCHEMA_VERSION, "schema_version")
                 )
                 await db.commit()
             elif row[0] == "3":
                 await _migrate_v3_to_v4(db)
+                await _migrate_v4_to_v5(db)
+                await db.execute(
+                    "UPDATE meta SET v = ? WHERE k = ?", (_SCHEMA_VERSION, "schema_version")
+                )
+                await db.commit()
+            elif row[0] == "4":
+                await _migrate_v4_to_v5(db)
                 await db.execute(
                     "UPDATE meta SET v = ? WHERE k = ?", (_SCHEMA_VERSION, "schema_version")
                 )
@@ -233,10 +244,10 @@ CREATE TABLE IF NOT EXISTS images (
         )
         if images:
             await self._db.executemany(
-                "INSERT INTO images (session_id, id, mime_type, width, height, data) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                [(session_id, image.id, image.mime_type, image.width, image.height, image.data)
-                 for image in images],
+                "INSERT INTO images (session_id, id, mime_type, width, height, data, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(session_id, image.id, image.mime_type, image.width, image.height, image.data,
+                  payload["created_at"]) for image in images],
             )
         await self._db.commit()
         _harden_wal_sidecars(self._path)
@@ -289,22 +300,41 @@ CREATE TABLE IF NOT EXISTS images (
 
     @_serialize_write
     async def save_image(
-        self, session_id: str, image: ImageAsset, max_bytes: int, max_count: int
+        self, session_id: str, image: ImageAsset, max_bytes: int, max_count: int,
+        now: int | None = None,
     ) -> None:
         # The budget check and insertion are one SQLite statement, so simultaneous
         # uploads cannot both consume the same remaining allowance.
         await self._db.execute(
-            "INSERT OR IGNORE INTO images (session_id, id, mime_type, width, height, data) "
-            "SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?) "
+            "INSERT OR IGNORE INTO images "
+            "(session_id, id, mime_type, width, height, data, created_at) "
+            "SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?) "
             "AND (SELECT COALESCE(SUM(length(data)), 0) FROM images WHERE session_id = ?) "
             "+ ? <= ? AND (SELECT COUNT(*) FROM images WHERE session_id = ?) < ?",
             (session_id, image.id, image.mime_type, image.width, image.height, image.data,
+             int(time.time()) if now is None else now,
              session_id, session_id, len(image.data), max_bytes, session_id, max_count),
         )
         await self._db.commit()
         if await self.load_image(session_id, image.id) is None:
             raise ImageError("session image limit exceeded", 413)
         _harden_wal_sidecars(self._path)
+
+    @_serialize_write
+    async def prune_images(self, session_id: str, keep: set[str], before: int) -> int:
+        """Delete the session's images created before ``before`` whose ids are not in
+        ``keep``; return how many went."""
+        async with self._db.execute(
+            "SELECT id FROM images WHERE session_id = ? AND created_at < ?", (session_id, before)
+        ) as cursor:
+            stale = [row[0] for row in await cursor.fetchall() if row[0] not in keep]
+        if stale:
+            await self._db.executemany(
+                "DELETE FROM images WHERE session_id = ? AND id = ?",
+                [(session_id, image_id) for image_id in stale],
+            )
+            await self._db.commit()
+        return len(stale)
 
     async def load_image(self, session_id: str, image_id: str) -> ImageAsset | None:
         async with self._db.execute(
@@ -421,6 +451,15 @@ async def _migrate_v1_to_v2(db: aiosqlite.Connection) -> None:
         columns = {row[1] for row in await cursor.fetchall()}
     if "docs" not in columns:
         await db.execute("ALTER TABLE sessions ADD COLUMN docs TEXT NOT NULL DEFAULT '[]'")
+
+
+async def _migrate_v4_to_v5(db: aiosqlite.Connection) -> None:
+    async with db.execute("PRAGMA table_info(images)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    # Images stored before the column existed read as created at zero: old enough
+    # to free when a full budget needs room and nothing references them.
+    if "created_at" not in columns:
+        await db.execute("ALTER TABLE images ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0")
 
 
 async def _migrate_v3_to_v4(db: aiosqlite.Connection) -> None:

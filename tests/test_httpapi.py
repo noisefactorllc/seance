@@ -739,7 +739,7 @@ async def test_failed_image_seed_storage_rolls_back_session(app_factory):
 
 
 async def test_image_upload_rate_is_bounded_even_for_duplicate_bytes(app_factory):
-    ctx = await app_factory(SEANCE_LIMIT_MAX_IMAGES="2")
+    ctx = await app_factory(SEANCE_LIMIT_IMAGE_UPLOADS_PER_MINUTE="2")
     session_id, headers, _, _ = await image_session(ctx, images=[])
     statuses = [(await ctx.client.post(f"/v1/sessions/{session_id}/images",
                                       headers=headers, json=IMAGE)).status for _ in range(3)]
@@ -832,3 +832,45 @@ async def test_multipart_seed_keeps_the_session_byte_budget(app_factory):
                                       data=_seed_form({"snapshot": None}, [PNG, different]))
     assert response.status == 413
     assert await ctx.store.count_sessions() == 0
+
+
+def _png_variant(n: int) -> bytes:
+    """A distinct valid PNG: the IHDR is intact, one IDAT byte differs."""
+    return PNG[:45] + bytes([PNG[45] ^ n]) + PNG[46:]
+
+
+async def test_full_image_budget_frees_unreferenced_images_after_the_grace_window(
+    app_factory, clock
+):
+    ctx = await app_factory(SEANCE_LIMIT_MAX_IMAGES="2")
+    session_id, headers, conn, session = await image_session(ctx, images=[])
+    path = f"/v1/sessions/{session_id}/images"
+    png = {**headers, "Content-Type": "image/png"}
+    first, second, third = (_png_variant(n) for n in (1, 2, 3))
+    ids = [hashlib.sha256(data).hexdigest() for data in (first, second, third)]
+    assert [(await ctx.client.post(path, headers=png, data=data)).status
+            for data in (first, second)] == [201, 201]
+    # The session still refers to the first image; the second is no longer used.
+    session.state.bulk_set([{"id": "k", "value": f"image:{ids[0]}"}], session.seq + 1,
+                           by=conn.identity.user_id)
+    # A fresh upload may still be waiting for the edit that refers to it.
+    assert (await ctx.client.post(path, headers=png, data=third)).status == 413
+    clock.advance(601)
+    assert (await ctx.client.post(path, headers=png, data=third)).status == 201
+    statuses = [(await ctx.client.get(f"{path}/{image_id}", headers=headers)).status
+                for image_id in ids]
+    assert statuses == [200, 404, 200]
+
+
+async def test_a_full_budget_of_referenced_images_stays_full(app_factory, clock):
+    ctx = await app_factory(SEANCE_LIMIT_MAX_IMAGES="1")
+    session_id, headers, conn, session = await image_session(ctx, images=[])
+    path = f"/v1/sessions/{session_id}/images"
+    png = {**headers, "Content-Type": "image/png"}
+    assert (await ctx.client.post(path, headers=png, data=_png_variant(1))).status == 201
+    referenced = hashlib.sha256(_png_variant(1)).hexdigest()
+    session.state.bulk_set([{"id": "k", "value": f"image:{referenced}"}], session.seq + 1,
+                           by=conn.identity.user_id)
+    clock.advance(601)
+    assert (await ctx.client.post(path, headers=png, data=_png_variant(2))).status == 413
+    assert (await ctx.client.get(f"{path}/{referenced}", headers=headers)).status == 200

@@ -29,7 +29,9 @@ always lands in the store before the session it belongs to is frozen.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import secrets
 import string
 import time
@@ -40,13 +42,14 @@ from app.audit import AuditEvent
 from app.config import Config
 from app.engine import EngineLimit
 from app.identity import Identity, Kind
-from app.images import ImageAsset
+from app.images import ImageAsset, ImageError
 from app.ratelimit import KeyedLimiter
 from app.session import ConnLike, JoinRefused, Session
 from app.store import Store
 from app.textdoc import TextDocReject
 
 log = logging.getLogger("seance.hub")
+_IMAGE_ID = re.compile(r"[a-f0-9]{64}")
 
 _ID_ALPHABET = string.ascii_letters + string.digits
 _ID_LENGTH = 6
@@ -241,9 +244,22 @@ class Hub:
         try:
             async with lock:
                 self.authorize_image(session_id, identity, write=True)
-                await self.store.save_image(
-                    session_id, image, self.limits.max_image_session_bytes, self.limits.max_images
-                )
+                budget = (self.limits.max_image_session_bytes, self.limits.max_images)
+                now = int(self.clock())
+                try:
+                    await self.store.save_image(session_id, image, *budget, now=now)
+                except ImageError as exc:
+                    # A full budget frees images that nothing in the session refers to
+                    # any more and that are older than the grace window (a fresh upload
+                    # waits for the edit that refers to it), then tries once more.
+                    if exc.status != 413:
+                        raise
+                    state = json.dumps(self.live[session_id].to_snapshot())
+                    referenced = set(_IMAGE_ID.findall(state))
+                    before = now - int(self.limits.image_prune_grace)
+                    if not await self.store.prune_images(session_id, referenced, before):
+                        raise
+                    await self.store.save_image(session_id, image, *budget, now=now)
         finally:
             self._release_lock_ref(session_id)
 

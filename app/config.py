@@ -77,6 +77,8 @@ class Limits:
     max_image_bytes: int = 8_388_608
     max_image_session_bytes: int = 33_554_432
     max_images: int = 32
+    image_uploads_per_minute: int = 240
+    image_prune_grace: float = 600.0
     max_value_bytes: int = 8192
     max_state_id_len: int = 128
     chat_history: int = 200

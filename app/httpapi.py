@@ -128,7 +128,9 @@ class _HttpApi:
             config.limits.creates_per_ip_hour, _ANON_WINDOW, clock
         )
         self._probe_limiter = KeyedLimiter(config.limits.joins_per_ip_min, _JOIN_WINDOW, clock)
-        self._image_limiter = KeyedLimiter(config.limits.max_images, _JOIN_WINDOW, clock)
+        self._image_limiter = KeyedLimiter(
+            config.limits.image_uploads_per_minute, _JOIN_WINDOW, clock
+        )
         self._startup_iso = datetime.fromtimestamp(clock(), tz=UTC).isoformat()
         self._meta_body = self._read_meta_body()
 
