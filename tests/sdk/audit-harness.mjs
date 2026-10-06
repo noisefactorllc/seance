@@ -78,7 +78,7 @@ export function harness(extra = {}) {
     FakeWebSocket.instances = []
     const fetchCalls = []
     const fetch = async (url, init) => {
-        fetchCalls.push({ url, init, body: JSON.parse(init.body) })
+        fetchCalls.push({ url, init, body: typeof init.body === 'string' ? JSON.parse(init.body) : init.body })
         return { ok: true, status: 201, json: async () => ({ session_id: 'abc123', anon_token: 'anon-token' }) }
     }
     const layer = createOnlineDslLayer({

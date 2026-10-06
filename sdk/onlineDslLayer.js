@@ -1,5 +1,5 @@
 import { peerColor } from './peerColors.js'
-import { prepareImage } from './images.js'
+import { prepareImage, seedImage } from './images.js'
 import { applyTextEdit, diffText, rebaseTextWithLocalEdit, transformSelection } from './textOps.js'
 
 const DEFAULT_DOC_ID = 'main'
@@ -231,16 +231,21 @@ class OnlineDslLayer {
         if (!this.fetch) throw new Error('fetch is not available')
         const generation = ++this._connectionGeneration
         const snapshot = this._normalizeSeed(seed)
+        const images = seed?.images?.length ? await Promise.all(seed.images.map(seedImage)) : []
+        if (generation !== this._connectionGeneration) throw new Error('connection superseded')
+        const session = { snapshot, dialect: this.options.dialect }
+        let request = JSON.stringify(session)
+        const headers = this.anonToken ? { 'X-Seance-Anon': this.anonToken } : {}
+        if (images.length) {
+            // Seed images travel as binary file parts beside the JSON seed.
+            request = new FormData()
+            request.append('session', new Blob([JSON.stringify(session)], { type: 'application/json' }))
+            for (const image of images) request.append('image', image.blob, image.id)
+        } else {
+            headers['Content-Type'] = 'application/json'
+        }
         const response = await this.fetch(`${this._httpBaseUrl()}/v1/sessions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(this.anonToken ? { 'X-Seance-Anon': this.anonToken } : {}),
-            },
-            credentials: 'include',
-            body: JSON.stringify({ snapshot, dialect: this.options.dialect,
-                ...(seed?.images?.length ? { images: seed.images } : {}),
-            }),
+            method: 'POST', headers, credentials: 'include', body: request,
         })
         if (generation !== this._connectionGeneration) throw new Error('connection superseded')
         if (!response.ok) {
@@ -260,8 +265,8 @@ class OnlineDslLayer {
         this._checkImageSession(sessionId, generation)
         const response = await this.fetch(`${this._httpBaseUrl()}/v1/sessions/${encodeURIComponent(sessionId)}/images`, {
             method: 'POST', credentials: 'include',
-            headers: { 'Content-Type': 'application/json', ...(this.anonToken ? { 'X-Seance-Anon': this.anonToken } : {}) },
-            body: JSON.stringify(image),
+            headers: { 'Content-Type': image.mimeType, ...(this.anonToken ? { 'X-Seance-Anon': this.anonToken } : {}) },
+            body: image.blob,
         })
         this._checkImageSession(sessionId, generation)
         if (!response.ok) throw new Error(`Image upload failed (${response.status})`)

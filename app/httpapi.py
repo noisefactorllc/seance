@@ -38,7 +38,15 @@ from app.clientip import resolve_client_ip
 from app.config import Config
 from app.hub import Hub, HubError
 from app.identity import IdentityService, Kind, MintLimited
-from app.images import IMAGE_ID_RE, ImageError, validate_image, validate_images
+from app.images import (
+    IMAGE_ID_RE,
+    IMAGE_TYPES,
+    ImageError,
+    bounded_images,
+    image_from_bytes,
+    validate_image,
+    validate_images,
+)
 from app.ratelimit import KeyedLimiter
 
 # The create body seeds session content directly (state values, poly frame).
@@ -47,6 +55,27 @@ from app.ratelimit import KeyedLimiter
 # JSON.parse (or the server's own deepcopy) cannot handle them. Mirror the
 # WebSocket frame edge: refuse non-finite constants and deep nesting here.
 _MAX_BODY_DEPTH = 64
+
+
+def _json_body(raw: bytes):
+    """A JSON request body within the depth limit; any defect raises ValueError."""
+    try:
+        payload = json.loads(raw, parse_constant=_reject_constant)
+        protocol.validate_json_values(payload, _MAX_BODY_DEPTH)
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise ValueError("invalid json") from exc
+    return payload
+
+
+async def _read_part(part, limit: int, too_large: Exception) -> bytes:
+    """One multipart part's bytes, refusing more than ``limit``."""
+    chunks, size = [], 0
+    while chunk := await part.read_chunk():
+        size += len(chunk)
+        if size > limit:
+            raise too_large
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _reject_constant(name: str):
@@ -238,23 +267,32 @@ class _HttpApi:
             return web.json_response(
                 {"error": "rate_limited", "retry_after": int(_ANON_WINDOW)}, status=429
             )
-        raw = await request.read()
         snapshot = None
         dialect = None
         images = []
-        if raw:
+        payload = None
+        if request.content_type == "multipart/form-data":
+            # Images travel as binary file parts beside the JSON seed (images are never text).
             try:
-                payload = json.loads(raw, parse_constant=_reject_constant)
-                protocol.validate_json_values(payload, _MAX_BODY_DEPTH)
-            except (ValueError, UnicodeDecodeError, RecursionError):
+                payload, images = await self._multipart_seed(request)
+            except ImageError as exc:
+                return web.json_response({"error": str(exc)}, status=exc.status)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+        elif raw := await request.read():
+            # Earlier clients send one JSON body with base64 image seeds; it stays accepted.
+            try:
+                payload = _json_body(raw)
+            except ValueError:
                 return web.json_response({"error": "invalid json"}, status=400)
             if not isinstance(payload, dict):
                 return web.json_response({"error": "body must be a json object"}, status=400)
-            snapshot = payload.get("snapshot")
             try:
                 images = validate_images(payload.get("images", []), self._config.limits)
             except ImageError as exc:
                 return web.json_response({"error": str(exc)}, status=exc.status)
+        if payload is not None:
+            snapshot = payload.get("snapshot")
             # Images have their own bounded HTTP allowance. They never raise the
             # existing seed/snapshot text or WebSocket frame budgets.
             seed_bytes = len(json.dumps(snapshot).encode()) if snapshot is not None else 0
@@ -275,6 +313,32 @@ class _HttpApi:
         if minted is not None:
             self._set_anon_cookie(response, minted)
         return response
+
+    async def _multipart_seed(self, request: web.Request):
+        """A session seed sent as multipart form data: one ``session`` part holding the
+        JSON seed, and one binary ``image`` part per seed image."""
+        limits = self._config.limits
+        reader = await request.multipart()
+        payload, images = {}, []
+        while (part := await reader.next()) is not None:
+            if part.name == "session":
+                too_large = ValueError("session seed exceeds size limit")
+                payload = _json_body(
+                    await _read_part(part, limits.max_snapshot_frame + 65536, too_large)
+                )
+                if not isinstance(payload, dict):
+                    raise ValueError("session must be a json object")
+                if "images" in payload:
+                    raise ValueError("images travel as binary image parts")
+            elif part.name == "image":
+                if len(images) >= limits.max_images:
+                    raise ImageError("too many images", 413)
+                too_large = ImageError("image exceeds size limit", 413)
+                data = await _read_part(part, limits.max_image_bytes, too_large)
+                images.append(image_from_bytes(data, part.headers.get("Content-Type"), limits))
+            else:
+                raise ValueError("unexpected form field")
+        return payload, bounded_images(images, limits)
 
     async def _image_identity(self, request: web.Request, *, write: bool):
         if not self._anon_credential(request) and not request.cookies.get("SESSION"):
@@ -297,14 +361,21 @@ class _HttpApi:
                 return web.json_response(
                     {"error": "rate_limited", "retry_after": int(_JOIN_WINDOW)}, status=429
                 )
-            body_limit = ((self._config.limits.max_image_bytes + 2) // 3) * 4 + 1024
-            raw = await request.clone(client_max_size=body_limit).read()
-            try:
-                payload = json.loads(raw, parse_constant=_reject_constant)
-                protocol.validate_json_values(payload, _MAX_BODY_DEPTH)
-            except (ValueError, UnicodeDecodeError, RecursionError) as exc:
-                raise ImageError("invalid json") from exc
-            image = validate_image(payload, self._config.limits)
+            limits = self._config.limits
+            binary = request.content_type in (*IMAGE_TYPES, "application/octet-stream")
+            if binary:
+                # The image's own bytes; the server names it by their SHA-256.
+                raw = await request.clone(client_max_size=limits.max_image_bytes).read()
+                image = image_from_bytes(raw, request.content_type, limits)
+            else:
+                # Earlier clients send a JSON body with a base64 data URL; it stays accepted.
+                body_limit = ((limits.max_image_bytes + 2) // 3) * 4 + 1024
+                raw = await request.clone(client_max_size=body_limit).read()
+                try:
+                    payload = _json_body(raw)
+                except ValueError as exc:
+                    raise ImageError("invalid json") from exc
+                image = validate_image(payload, limits)
             await self._hub.save_image(request.match_info["id"], identity, image)
             return web.json_response(
                 {"id": image.id, "mimeType": image.mime_type,

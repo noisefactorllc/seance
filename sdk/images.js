@@ -70,7 +70,19 @@ export async function prepareImage(blob) {
     if (!(width > 0 && width <= 16384 && height > 0 && height <= 16384 && width * height <= 64000000)) throw new Error('Image dimensions exceed limits')
     const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes))
     const id = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')
-    let binary = ''
-    for (let at = 0; at < bytes.length; at += 16384) binary += String.fromCharCode(...bytes.subarray(at, at + 16384))
-    return { id, dataUrl: `data:${mimeType};base64,${btoa(binary)}`, width, height, mimeType }
+    // Images are images: the asset carries its bytes as a Blob, never as text.
+    return { id, blob: new Blob([bytes], { type: mimeType }), width, height, mimeType }
+}
+
+// A seed image as an asset with bytes: a Blob, an asset from prepareImage, or a
+// { dataUrl } record from an application written before images travelled as bytes.
+export async function seedImage(image) {
+    if (image instanceof Blob) return prepareImage(image)
+    if (image?.blob instanceof Blob) return prepareImage(image.blob)
+    const match = typeof image?.dataUrl === 'string' && /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]*={0,2})$/.exec(image.dataUrl)
+    if (!match) throw new Error('Images only; use PNG, JPEG, GIF or WebP')
+    const raw = atob(match[2])
+    const bytes = new Uint8Array(raw.length)
+    for (let at = 0; at < raw.length; at++) bytes[at] = raw.charCodeAt(at)
+    return prepareImage(new Blob([bytes], { type: match[1] }))
 }

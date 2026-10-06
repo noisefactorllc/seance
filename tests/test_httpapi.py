@@ -9,10 +9,12 @@ wrapped around a real :class:`app.hub.Hub` over a ``tmp_path`` store and a real
 
 import base64
 import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from cryptography.fernet import Fernet
@@ -742,3 +744,91 @@ async def test_image_upload_rate_is_bounded_even_for_duplicate_bytes(app_factory
     statuses = [(await ctx.client.post(f"/v1/sessions/{session_id}/images",
                                       headers=headers, json=IMAGE)).status for _ in range(3)]
     assert statuses == [201, 201, 429]
+
+
+# Images are images (operator, 2026-10-05): uploads and seeds travel as binary bytes.
+async def test_binary_image_upload_is_named_by_its_bytes_and_served_back_unchanged(app_factory):
+    ctx = await app_factory()
+    session_id, headers, _, _ = await image_session(ctx, images=[])
+    path = f"/v1/sessions/{session_id}/images"
+    png = {**headers, "Content-Type": "image/png"}
+    response = await ctx.client.post(path, headers=png, data=PNG)
+    assert response.status == 201
+    assert (await response.json())["id"] == IMAGE_ID
+    served = await ctx.client.get(f"{path}/{IMAGE_ID}", headers=headers)
+    assert served.content_type == "image/png"
+    assert await served.read() == PNG
+
+
+async def test_binary_image_upload_trusts_bytes_over_the_declared_type(app_factory):
+    ctx = await app_factory()
+    session_id, headers, _, _ = await image_session(ctx, images=[])
+    path = f"/v1/sessions/{session_id}/images"
+    jpeg = {**headers, "Content-Type": "image/jpeg"}
+    sniffed = await ctx.client.post(path, headers=jpeg, data=PNG)
+    assert sniffed.status == 201
+    assert (await sniffed.json())["mimeType"] == "image/png"
+    for body in (b"", b"not an image", b"GIF89a"):
+        png = {**headers, "Content-Type": "image/png"}
+        bad = await ctx.client.post(path, headers=png, data=body)
+        assert bad.status == 400
+
+
+async def test_binary_image_upload_keeps_membership_and_size_limits(app_factory):
+    ctx = await app_factory(SEANCE_LIMIT_MAX_IMAGE_BYTES=str(len(PNG) - 1))
+    session_id, headers, _, _ = await image_session(ctx, images=[])
+    path = f"/v1/sessions/{session_id}/images"
+    png = {**headers, "Content-Type": "image/png"}
+    assert (await ctx.client.post(path, headers=png, data=PNG)).status == 413
+    _, token = ctx.identity.mint_anon()
+    stranger = {"Origin": ALLOWED, "X-Seance-Anon": token, "Content-Type": "image/png"}
+    assert (await ctx.client.post(path, headers=stranger, data=PNG)).status == 403
+
+
+def _seed_form(session=None, images=()):
+    form = aiohttp.FormData()
+    if session is not None:
+        form.add_field("session", json.dumps(session), content_type="application/json")
+    for index, data in enumerate(images):
+        form.add_field("image", data, filename=f"{index}.png", content_type="image/png")
+    return form
+
+
+async def test_multipart_seed_stores_binary_images_with_the_session(app_factory):
+    ctx = await app_factory()
+    minted = await ctx.client.post("/v1/anon", headers={"Origin": ALLOWED})
+    token = (await minted.json())["anon_token"]
+    headers = {"Origin": ALLOWED, "X-Seance-Anon": token}
+    snapshot = {"state": [{"id": "k", "value": f"image:{IMAGE_ID}"}]}
+    response = await ctx.client.post("/v1/sessions", headers=headers,
+                                      data=_seed_form({"snapshot": snapshot}, [PNG, PNG]))
+    assert response.status == 201, await response.text()
+    session_id = (await response.json())["session_id"]
+    conn = FakeConn(ctx.identity.verify_anon(token))
+    await ctx.hub.connect(session_id, conn)
+    served = await ctx.client.get(f"/v1/sessions/{session_id}/images/{IMAGE_ID}", headers=headers)
+    assert served.status == 200
+    assert await served.read() == PNG
+    assert "data:image" not in str(conn.sent)
+
+
+@pytest.mark.parametrize("form, status", [
+    (lambda: _seed_form({"snapshot": None}, [b"not an image"]), 400),
+    (lambda: _seed_form({"images": [IMAGE]}), 400),
+    (lambda: _seed_form(["not", "an", "object"]), 400),
+    (lambda: _seed_form({"snapshot": None}, [PNG] * 3), 413),
+])
+async def test_invalid_multipart_seed_never_creates_session(app_factory, form, status):
+    ctx = await app_factory(SEANCE_LIMIT_MAX_IMAGES="2")
+    response = await ctx.client.post("/v1/sessions", headers={"Origin": ALLOWED}, data=form())
+    assert response.status == status
+    assert await ctx.store.count_sessions() == 0
+
+
+async def test_multipart_seed_keeps_the_session_byte_budget(app_factory):
+    ctx = await app_factory(SEANCE_LIMIT_MAX_IMAGE_SESSION_BYTES=str(len(PNG) + 10))
+    different = PNG[:45] + bytes([PNG[45] ^ 1]) + PNG[46:]
+    response = await ctx.client.post("/v1/sessions", headers={"Origin": ALLOWED},
+                                      data=_seed_form({"snapshot": None}, [PNG, different]))
+    assert response.status == 413
+    assert await ctx.store.count_sessions() == 0

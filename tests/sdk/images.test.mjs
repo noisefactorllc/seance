@@ -6,27 +6,39 @@ import { harness, finishHandshake, tick } from './audit-harness.mjs'
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XkAAAAASUVORK5CYII=', 'base64')
 const id = 'c21a896d2f3eba71a6310925059413201b176efcbb66f05491e7b5b86b7e3915'
-const asset = { id, dataUrl: `data:image/png;base64,${png.toString('base64')}`, width: 1, height: 1, mimeType: 'image/png' }
+const legacyAsset = { id, dataUrl: `data:image/png;base64,${png.toString('base64')}`, width: 1, height: 1, mimeType: 'image/png' }
+const bytesOf = async blob => Buffer.from(await blob.arrayBuffer())
+// Images are images: an asset carries its bytes as a Blob, never as a data URL.
+async function assertAsset(result, bytes, mimeType, size = [1, 1]) {
+    assert.deepEqual(Object.keys(result).sort(), ['blob', 'height', 'id', 'mimeType', 'width'])
+    assert.ok(result.blob instanceof Blob)
+    assert.equal(result.blob.type, mimeType)
+    assert.deepEqual(await bytesOf(result.blob), bytes)
+    assert.equal(result.mimeType, mimeType)
+    assert.deepEqual([result.width, result.height], size)
+}
 
 for (const fixture of JSON.parse(readFileSync(new URL('../fixtures/images.json', import.meta.url)))) {
     test(`prepareImage preserves ${fixture.mimeType} bytes and oriented dimensions${fixture.description ? ` (${fixture.description})` : ''}`, async () => {
         const result = await sdk.prepareImage(new Blob([Buffer.from(fixture.base64, 'base64')], { type: fixture.mimeType }))
-        assert.equal(result.dataUrl, `data:${fixture.mimeType};base64,${fixture.base64}`)
-        assert.deepEqual([result.width, result.height], [fixture.width, fixture.height])
+        await assertAsset(result, Buffer.from(fixture.base64, 'base64'), fixture.mimeType, [fixture.width, fixture.height])
     })
 }
 
 test('prepareImage preserves original raster bytes and derives their content ID and dimensions', async () => {
     assert.equal(typeof sdk.prepareImage, 'function')
-    assert.deepEqual(await sdk.prepareImage(new Blob([png], { type: 'image/png' })), asset)
+    const result = await sdk.prepareImage(new Blob([png], { type: 'image/png' }))
+    assert.equal(result.id, id)
+    await assertAsset(result, png, 'image/png')
 })
 
 test('prepareImage identifies raster blobs without a MIME type', async () => {
-    assert.deepEqual(await sdk.prepareImage(new Blob([png])), asset)
+    const result = await sdk.prepareImage(new Blob([png]))
+    assert.equal(result.id, id)
+    await assertAsset(result, png, 'image/png')
     for (const fixture of JSON.parse(readFileSync(new URL('../fixtures/images.json', import.meta.url)))) {
         const result = await sdk.prepareImage(new Blob([Buffer.from(fixture.base64, 'base64')]))
-        assert.equal(result.mimeType, fixture.mimeType)
-        assert.equal(result.dataUrl, `data:${fixture.mimeType};base64,${fixture.base64}`)
+        await assertAsset(result, Buffer.from(fixture.base64, 'base64'), fixture.mimeType, [fixture.width, fixture.height])
     }
     await assert.rejects(sdk.prepareImage(new Blob(['video data'])), /image/i)
 })
@@ -41,16 +53,44 @@ test('prepareImage refuses video, invalid raster data and excessive allocations'
     await assert.rejects(sdk.prepareImage(new Blob([oversized], { type: 'image/png' })), /dimension/i)
 })
 
-test('takeOnline sends images outside the text snapshot', async (t) => {
+// Seed images go as binary file parts beside the JSON seed, whatever form the app hands over.
+for (const [form, seed] of [
+    ['a Blob', () => new Blob([png], { type: 'image/png' })],
+    ['a prepared asset', () => sdk.prepareImage(new Blob([png], { type: 'image/png' }))],
+    ['a data URL record from an earlier application', () => legacyAsset],
+]) {
+    test(`takeOnline sends ${form} seed image as binary bytes outside the text snapshot`, async (t) => {
+        const { layer, sockets, fetchCalls } = harness()
+        t.after(() => layer.goOffline())
+        const pending = layer.takeOnline({ docs: [], images: [await seed()] })
+        await tick(); await tick()
+        await finishHandshake(pending, sockets.at(-1), [], {
+            type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'], anon_token: 'anon-token',
+        })
+        const body = fetchCalls[0].body
+        assert.ok(body instanceof FormData)
+        assert.equal(fetchCalls[0].init.headers['Content-Type'], undefined)
+        const session = JSON.parse(await body.get('session').text())
+        assert.equal(session.images, undefined)
+        assert.equal(session.snapshot.images, undefined)
+        const images = body.getAll('image')
+        assert.equal(images.length, 1)
+        assert.equal(images[0].type, 'image/png')
+        assert.deepEqual(await bytesOf(images[0]), png)
+        assert.doesNotMatch(JSON.stringify(session), /data:image/)
+    })
+}
+
+test('takeOnline without images keeps its JSON body', async (t) => {
     const { layer, sockets, fetchCalls } = harness()
     t.after(() => layer.goOffline())
-    const pending = layer.takeOnline({ docs: [], images: [asset] })
+    const pending = layer.takeOnline({ docs: [] })
     await tick()
     await finishHandshake(pending, sockets.at(-1), [], {
         type: 'hello', protocol: 1, dialects: ['noisemaker-dsl'], anon_token: 'anon-token',
     })
-    assert.deepEqual(fetchCalls[0].body.images, [asset])
-    assert.equal(fetchCalls[0].body.snapshot.images, undefined)
+    assert.equal(fetchCalls[0].init.headers['Content-Type'], 'application/json')
+    assert.equal(fetchCalls[0].body.images, undefined)
 })
 
 test('image transfer uses session identity and returns byte-identical blobs', async (t) => {
@@ -76,7 +116,9 @@ test('image transfer uses session identity and returns byte-identical blobs', as
         assert.equal(init.headers['X-Seance-Anon'], 'test-token')
         assert.equal(init.credentials, 'include')
     }
-    assert.deepEqual(JSON.parse(requests[0].init.body), asset)
+    assert.equal(requests[0].init.headers['Content-Type'], 'image/png')
+    assert.ok(requests[0].init.body instanceof Blob)
+    assert.deepEqual(await bytesOf(requests[0].init.body), png)
     await assert.rejects(layer.getImage('../secret'), /image/i)
     layer.fetch = async () => new Response('bad', { headers: { 'Content-Type': 'image/png' } })
     await assert.rejects(layer.getImage(id), /image/i)

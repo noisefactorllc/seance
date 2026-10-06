@@ -129,12 +129,40 @@ def validate_image(value, limits: Limits) -> ImageAsset:
     return ImageAsset(digest, mime, width, height, data)
 
 
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+
+def image_from_bytes(data: bytes, mime: str | None, limits: Limits) -> ImageAsset:
+    """An image sent as its own bytes. The server names it by their SHA-256; the
+    declared type is a hint, and the bytes decide."""
+    if not data:
+        raise ImageError("image is empty")
+    if len(data) > limits.max_image_bytes:
+        raise ImageError("image exceeds size limit", 413)
+    for candidate in sorted(IMAGE_TYPES, key=lambda value: value != mime):
+        try:
+            width, height = image_dimensions(data, candidate)
+        except ImageError:
+            continue
+        if not (0 < width <= 16384 and 0 < height <= 16384 and width * height <= 64_000_000):
+            raise ImageError("image dimensions exceed limits", 413)
+        return ImageAsset(hashlib.sha256(data).hexdigest(), candidate, width, height, data)
+    raise ImageError("invalid or unsupported image; use PNG, JPEG, GIF or WebP")
+
+
+def bounded_images(images: list[ImageAsset], limits: Limits) -> list[ImageAsset]:
+    """One session's seed images, deduplicated by id, within the count and byte budgets."""
+    if len(images) > limits.max_images:
+        raise ImageError("too many images", 413)
+    unique = {image.id: image for image in images}
+    if sum(len(image.data) for image in unique.values()) > limits.max_image_session_bytes:
+        raise ImageError("session images exceed size limit", 413)
+    return list(unique.values())
+
+
 def validate_images(values, limits: Limits) -> list[ImageAsset]:
     if not isinstance(values, list):
         raise ImageError("images must be an array")
     if len(values) > limits.max_images:
         raise ImageError("too many images", 413)
-    images = {image.id: image for value in values if (image := validate_image(value, limits))}
-    if sum(len(image.data) for image in images.values()) > limits.max_image_session_bytes:
-        raise ImageError("session images exceed size limit", 413)
-    return list(images.values())
+    return bounded_images([validate_image(value, limits) for value in values], limits)
