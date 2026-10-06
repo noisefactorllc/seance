@@ -82,9 +82,8 @@ time. Local runs synthesize a `{"git_hash": "dev"}` placeholder.
 
 ## Contributing
 
-Issues and pull requests are welcome. Please read
-[CONTRIBUTING.md](CONTRIBUTING.md) and
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before opening changes.
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the Noise Factor
+[Code of Conduct](https://github.com/noisefactorllc/.github/blob/main/CODE_OF_CONDUCT.md) before opening changes.
 
 ## License
 

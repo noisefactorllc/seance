@@ -2,6 +2,12 @@
 
 Thanks for your interest in contributing.
 
+Contributions follow the Noise Factor
+[contributing policy](https://github.com/noisefactorllc/.github/blob/main/CONTRIBUTING.md) and
+[Code of Conduct](https://github.com/noisefactorllc/.github/blob/main/CODE_OF_CONDUCT.md). The policy covers which pull requests we
+accept and what LLM-assisted pull requests need to include. This page adds
+what's specific to Seance.
+
 ## Getting Set Up
 
 ```bash
@@ -43,10 +49,11 @@ smoke test.
 
 ## Submitting Changes
 
-1. Fork the repo and create a branch from `main`.
-2. Make focused changes with tests where behavior changes.
-3. Run the Python and SDK checks above.
-4. Open a pull request with a clear description of what changed and why.
+1. Pick an issue labelled `help wanted` and comment on it to say you're working on it.
+2. Fork the repo and create a branch from `main`.
+3. Make focused changes with tests where behavior changes.
+4. Run the Python and SDK checks above.
+5. Open a pull request and fill in the template.
 
 ## Reporting Issues
 
