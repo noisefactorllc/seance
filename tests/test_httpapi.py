@@ -463,6 +463,16 @@ async def test_session_probe_unknown_not_found(app_factory):
     assert (await r.json())["error"] == "unknown session"
 
 
+async def test_session_probe_ignores_case_and_returns_the_session_id(app_factory):
+    ctx = await app_factory()
+    session_id = await ctx.hub.create_session(_member())
+    r = await ctx.client.get(f"/v1/sessions/{session_id.swapcase()}")
+    assert r.status == 200
+    assert await r.json() == {
+        "id": session_id, "open": True, "dialect": protocol.DEFAULT_DIALECT,
+    }
+
+
 async def test_session_probe_rate_limited(app_factory):
     # With the per-IP join budget pinned to 1, the first probe consumes it (still
     # reaching the 404), and the second is refused before any store lookup.

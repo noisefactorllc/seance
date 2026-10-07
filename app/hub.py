@@ -179,14 +179,37 @@ class Hub:
     # --------------------------------------------------------------------- #
 
     async def _new_session_id(self) -> str:
-        """Mint a 6-char id absent from both the live map and the store."""
+        """Mint a 6-char id that no live or stored id matches, ignoring case.
+
+        People retype codes in capitals, and :meth:`resolve_session_id` finds a
+        session whatever the case, so no two sessions may differ only in case.
+        """
         while True:
             candidate = "".join(secrets.choice(_ID_ALPHABET) for _ in range(_ID_LENGTH))
-            if candidate in self.live:
-                continue
-            if await self.store.load_session(candidate) is not None:
+            if await self._ids_ignoring_case(candidate):
                 continue
             return candidate
+
+    async def _ids_ignoring_case(self, session_id: str) -> set[str]:
+        """Every live or stored id equal to ``session_id`` when case is ignored."""
+        folded = session_id.lower()
+        ids = {sid for sid in self.live if sid.lower() == folded}
+        ids.update(await self.store.session_ids_ignoring_case(session_id))
+        return ids
+
+    async def resolve_session_id(self, session_id: str) -> str | None:
+        """The id of the session ``session_id`` names, whatever its case.
+
+        An exact match wins. Otherwise the one id equal to it with case ignored,
+        or None when there is none, or more than one from before ids were kept
+        distinct in case.
+        """
+        if session_id in self.live or await self.store.load_session(session_id) is not None:
+            return session_id
+        if not session_id.isascii():
+            return None
+        ids = await self._ids_ignoring_case(session_id)
+        return ids.pop() if len(ids) == 1 else None
 
     async def create_session(
         self, identity: Identity, snapshot: dict | None = None, dialect: str | None = None,

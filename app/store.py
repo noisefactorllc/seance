@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, session_id TEXT,
   actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS sessions_frozen_at ON sessions (frozen_at);
+CREATE INDEX IF NOT EXISTS sessions_id_nocase ON sessions (id COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS images (
   session_id TEXT NOT NULL, id TEXT NOT NULL, mime_type TEXT NOT NULL,
   width INTEGER NOT NULL, height INTEGER NOT NULL, data BLOB NOT NULL,
@@ -251,6 +252,13 @@ CREATE TABLE IF NOT EXISTS images (
             )
         await self._db.commit()
         _harden_wal_sidecars(self._path)
+
+    async def session_ids_ignoring_case(self, session_id: str) -> list[str]:
+        """Return up to two stored ids equal to ``session_id`` when case is ignored."""
+        async with self._db.execute(
+            "SELECT id FROM sessions WHERE id = ? COLLATE NOCASE LIMIT 2", (session_id,)
+        ) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
 
     async def load_session(self, session_id: str) -> dict | None:
         """Return the session payload for ``session_id`` (JSON columns decoded) or None."""

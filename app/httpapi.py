@@ -410,7 +410,11 @@ class _HttpApi:
             return web.json_response(
                 {"error": "rate_limited", "retry_after": int(_JOIN_WINDOW)}, status=429
             )
-        session_id = request.match_info["id"]
+        # A code retyped in another case still finds its session; the reply
+        # carries the session's own id for the client to join with.
+        session_id = await self._hub.resolve_session_id(request.match_info["id"])
+        if session_id is None:
+            return web.json_response({"error": "unknown session"}, status=404)
         live = self._hub.live.get(session_id)
         if live is not None:
             return web.json_response(

@@ -209,6 +209,49 @@ async def test_create_regenerates_id_on_collision(hub_factory, clock, monkeypatc
     assert await store.load_session("BBBBBB") is not None
 
 
+async def test_create_regenerates_id_that_differs_only_in_case(hub_factory, clock, monkeypatch):
+    # A code retyped in capitals must name one session, so a new id may not
+    # match an existing one with case ignored.
+    hub, store = await hub_factory()
+    seed = Session("seed", "someone", Limits(), clock).freeze_snapshot()
+    seed["frozen_at"] = int(clock.now)
+    await store.save_session("AbCdEf", seed)
+    chars = iter("ABCDEFBBBBBB")
+    monkeypatch.setattr(app.hub.secrets, "choice", lambda seq: next(chars))
+    assert await hub.create_session(member("owner")) == "BBBBBB"
+
+
+async def test_resolve_session_id_ignores_case(hub_factory, clock):
+    hub, store = await hub_factory()
+    seed = Session("seed", "someone", Limits(), clock).freeze_snapshot()
+    seed["frozen_at"] = int(clock.now)
+    await store.save_session("RouFjG", seed)
+    assert await hub.resolve_session_id("RouFjG") == "RouFjG"
+    assert await hub.resolve_session_id("ROUFJG") == "RouFjG"
+    assert await hub.resolve_session_id("roufjg") == "RouFjG"
+    assert await hub.resolve_session_id("ZZZZZZ") is None
+
+
+async def test_resolve_session_id_finds_a_live_session_in_another_case(hub_factory):
+    hub, store = await hub_factory()
+    sid = await hub.create_session(member("owner"))
+    await hub.connect(sid, FakeConn(member("owner")))
+    assert await hub.resolve_session_id(sid.swapcase()) == sid
+
+
+async def test_resolve_session_id_refuses_ids_that_differ_only_in_case(hub_factory, clock):
+    # Ids minted before they were kept distinct in case can collide; such a
+    # code names no one session, so neither is guessed.
+    hub, store = await hub_factory()
+    seed = Session("seed", "someone", Limits(), clock).freeze_snapshot()
+    seed["frozen_at"] = int(clock.now)
+    await store.save_session("abcdef", seed)
+    await store.save_session("ABCDEF", seed)
+    assert await hub.resolve_session_id("abcdef") == "abcdef"
+    assert await hub.resolve_session_id("ABCDEF") == "ABCDEF"
+    assert await hub.resolve_session_id("AbCdEf") is None
+
+
 # --------------------------------------------------------------------------- #
 # connect / disconnect
 # --------------------------------------------------------------------------- #

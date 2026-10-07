@@ -74,7 +74,10 @@ a client's `hello.dialects` must match it to join) and must match
 `GET /v1/sessions/{id}` is a lightweight pre-connect probe sharing the join
 rate limiter (`joins_per_ip_min`): `200 {"id", "open": bool, "dialect":
 "<string>"}` for a known session, live or frozen (`open` is `false` when
-locked), or `404 {"error": "unknown session"}`.
+locked), or `404 {"error": "unknown session"}`. The probe ignores case: a code
+retyped in capitals finds its session, and `id` is the session's own id, which
+the client joins with. No two sessions are minted that differ only in case; a
+code that matches more than one older session with case ignored is `404`.
 
 ## 2. Handshake sequence
 
