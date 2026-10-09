@@ -232,6 +232,23 @@ async def test_resolve_session_id_ignores_case(hub_factory, clock):
     assert await hub.resolve_session_id("ZZZZZZ") is None
 
 
+async def test_resolve_session_id_does_not_decode_the_payload(hub_factory, clock, monkeypatch):
+    # The exact match is an existence probe: the session probe path runs it on
+    # the event loop, where load_session would decode up to max_session_bytes
+    # of JSON a second time (the probe reads the row again for its fields).
+    hub, store = await hub_factory()
+    seed = Session("seed", "someone", Limits(), clock).freeze_snapshot()
+    seed["frozen_at"] = int(clock.now)
+    await store.save_session("RouFjG", seed)
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("resolve_session_id must not decode the payload")
+
+    monkeypatch.setattr(store, "load_session", explode)
+    assert await hub.resolve_session_id("RouFjG") == "RouFjG"
+    assert await hub.resolve_session_id("ZZZZZZ") is None
+
+
 async def test_resolve_session_id_finds_a_live_session_in_another_case(hub_factory):
     hub, store = await hub_factory()
     sid = await hub.create_session(member("owner"))

@@ -257,6 +257,18 @@ async def test_load_missing_returns_none(tmp_path):
         await store.close()
 
 
+async def test_session_exists_is_a_primary_key_probe(tmp_path):
+    store = await Store.open(str(tmp_path / "test.db"))
+    try:
+        assert await store.session_exists("s1") is False
+        await store.save_session("s1", _sample_payload())
+        assert await store.session_exists("s1") is True
+        await store.delete_session("s1")
+        assert await store.session_exists("s1") is False
+    finally:
+        await store.close()
+
+
 async def test_count_sessions_tracks_persisted_rows(tmp_path):
     store = await Store.open(str(tmp_path / "test.db"))
     try:

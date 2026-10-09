@@ -607,7 +607,7 @@ async def test_unhandled_handler_error_returns_internal_500(app_factory, caplog)
 
 async def test_unhandled_error_log_uses_route_template_not_session_id(app_factory, caplog):
     ctx = await app_factory()
-    raw_session_id = "private-session-id"
+    raw_session_id = await ctx.hub.create_session(_member())
 
     async def _boom(*_args, **_kwargs):
         raise RuntimeError("store unavailable")

@@ -260,6 +260,18 @@ CREATE TABLE IF NOT EXISTS images (
         ) as cursor:
             return [row[0] for row in await cursor.fetchall()]
 
+    async def session_exists(self, session_id: str) -> bool:
+        """Whether a row for ``session_id`` exists (a primary-key lookup).
+
+        Existence probes must not decode the whole payload: ``load_session``
+        JSON-decodes up to ``max_session_bytes`` of content, and the session
+        probe runs on the event loop for every pre-connect check.
+        """
+        async with self._db.execute(
+            "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
     async def load_session(self, session_id: str) -> dict | None:
         """Return the session payload for ``session_id`` (JSON columns decoded) or None."""
         async with self._db.execute(

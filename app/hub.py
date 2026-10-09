@@ -204,7 +204,10 @@ class Hub:
         or None when there is none, or more than one from before ids were kept
         distinct in case.
         """
-        if session_id in self.live or await self.store.load_session(session_id) is not None:
+        # The exact match is a primary-key existence check, not load_session:
+        # decoding the whole payload (up to max_session_bytes, on the event loop)
+        # is paid twice per probe otherwise — here and for the probe's own read.
+        if session_id in self.live or await self.store.session_exists(session_id):
             return session_id
         if not session_id.isascii():
             return None
