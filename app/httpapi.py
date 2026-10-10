@@ -420,14 +420,17 @@ class _HttpApi:
             return web.json_response(
                 {"id": session_id, "open": not live.settings.locked, "dialect": live.dialect}
             )
-        payload = await self._hub.store.load_session(session_id)
-        if payload is None:
+        # The frozen branch answers from the small settings/dialect columns: a
+        # full payload decode (up to max_session_bytes, on the event loop) buys
+        # nothing for a probe that reports locked and dialect only.
+        meta = await self._hub.store.session_meta(session_id)
+        if meta is None:
             return web.json_response({"error": "unknown session"}, status=404)
         return web.json_response(
             {
                 "id": session_id,
-                "open": not payload["settings"]["locked"],
-                "dialect": payload.get("dialect", protocol.DEFAULT_DIALECT),
+                "open": not meta["locked"],
+                "dialect": meta["dialect"] or protocol.DEFAULT_DIALECT,
             }
         )
 

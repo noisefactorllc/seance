@@ -272,6 +272,22 @@ CREATE TABLE IF NOT EXISTS images (
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    async def session_meta(self, session_id: str) -> dict | None:
+        """Return the session's probe fields without decoding its content.
+
+        Reads only the small ``settings`` and ``dialect`` columns and decodes the
+        settings object: the pre-connect probe runs on the event loop, where
+        ``load_session`` would JSON-decode up to ``max_session_bytes`` of
+        state/data/poly/docs/chat a request only needs ``locked`` from.
+        """
+        async with self._db.execute(
+            "SELECT settings, dialect FROM sessions WHERE id = ?", (session_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {"locked": bool(json.loads(row[0])["locked"]), "dialect": row[1]}
+
     async def load_session(self, session_id: str) -> dict | None:
         """Return the session payload for ``session_id`` (JSON columns decoded) or None."""
         async with self._db.execute(

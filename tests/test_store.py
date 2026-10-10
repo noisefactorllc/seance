@@ -269,6 +269,21 @@ async def test_session_exists_is_a_primary_key_probe(tmp_path):
         await store.close()
 
 
+async def test_session_meta_reads_probe_fields_without_decoding_content(tmp_path):
+    store = await Store.open(str(tmp_path / "test.db"))
+    try:
+        assert await store.session_meta("s1") is None
+        payload = _sample_payload()
+        payload["settings"]["locked"] = True
+        payload["dialect"] = "custom-dsl"
+        await store.save_session("s1", payload)
+        assert await store.session_meta("s1") == {"locked": True, "dialect": "custom-dsl"}
+        await store.delete_session("s1")
+        assert await store.session_meta("s1") is None
+    finally:
+        await store.close()
+
+
 async def test_count_sessions_tracks_persisted_rows(tmp_path):
     store = await Store.open(str(tmp_path / "test.db"))
     try:

@@ -473,6 +473,40 @@ async def test_session_probe_ignores_case_and_returns_the_session_id(app_factory
     }
 
 
+async def test_session_probe_frozen_locked_closed(app_factory, clock):
+    ctx = await app_factory()
+    session_id = await ctx.hub.create_session(_member())
+    await ctx.hub.connect(session_id, FakeConn(_member()))
+    session = ctx.hub.live[session_id]
+    session.settings.locked = True
+    ctx.hub.disconnect(session, next(iter(session.conns)))
+    clock.advance(ctx.hub.limits.freeze_grace)
+    await ctx.hub.scan()  # freezes the empty session; the lock travels to the row
+    r = await ctx.client.get(f"/v1/sessions/{session_id}")
+    assert r.status == 200
+    assert await r.json() == {
+        "id": session_id, "open": False, "dialect": protocol.DEFAULT_DIALECT,
+    }
+
+
+async def test_session_probe_does_not_decode_the_payload(app_factory, monkeypatch):
+    # The probe reports locked and dialect only; answering it must not pay a
+    # full load_session decode of up to max_session_bytes of JSON on the
+    # event loop (the same rule resolve_session_id already follows).
+    ctx = await app_factory()
+    session_id = await ctx.hub.create_session(_member())  # persisted frozen, not live
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("session probe must not decode the payload")
+
+    monkeypatch.setattr(ctx.store, "load_session", explode)
+    r = await ctx.client.get(f"/v1/sessions/{session_id}")
+    assert r.status == 200
+    assert await r.json() == {
+        "id": session_id, "open": True, "dialect": protocol.DEFAULT_DIALECT,
+    }
+
+
 async def test_session_probe_rate_limited(app_factory):
     # With the per-IP join budget pinned to 1, the first probe consumes it (still
     # reaching the 404), and the second is refused before any store lookup.
@@ -612,7 +646,7 @@ async def test_unhandled_error_log_uses_route_template_not_session_id(app_factor
     async def _boom(*_args, **_kwargs):
         raise RuntimeError("store unavailable")
 
-    ctx.store.load_session = _boom
+    ctx.store.session_meta = _boom
     with caplog.at_level(logging.ERROR, logger="seance.http"):
         r = await ctx.client.get(f"/v1/sessions/{raw_session_id}")
 
