@@ -256,8 +256,8 @@ def test_origins_normalized():
 
 
 def test_service_secrets_parse():
-    cfg = Config.from_env(_minimal_env(SEANCE_SERVICE_SECRETS="bot:abc,ehsre:def"))
-    assert cfg.service_secrets == {"bot": "abc", "ehsre": "def"}
+    cfg = Config.from_env(_minimal_env(SEANCE_SERVICE_SECRETS="bot:abc,agent:def"))
+    assert cfg.service_secrets == {"bot": "abc", "agent": "def"}
 
 
 def test_empty_string_env_treated_as_unset():
