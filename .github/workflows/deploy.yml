@@ -1,11 +1,11 @@
 name: Deploy
 
 # Seance is a public repository, so it holds no registry or server credential
-# and cannot deploy itself. Scaffold is the only builder and deployer: this
-# workflow just tells it which commit to release, using a GitHub App token
-# minted from the one secret this repo does hold.
+# and cannot deploy itself. A private deploy workflow is the only builder and
+# deployer: this workflow just tells it which commit to release, using a
+# GitHub App token minted from the one secret this repo does hold.
 #
-# CI is the gate. Scaffold's deploy-seance.yml independently verifies that the
+# CI is the gate. The deploy workflow independently verifies that the
 # commit is reachable from main and that this repo's ci.yml passed for it, so
 # dispatching before CI finishes would simply be refused. Waiting for the ci
 # workflow_run is what makes a push to main deploy on its own.
@@ -29,8 +29,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  trigger-scaffold-deploy:
-    name: Dispatch scaffold deploy-seance
+  dispatch-deploy:
+    name: Dispatch the deploy
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'workflow_run' &&
@@ -56,7 +56,21 @@ jobs:
             const ran = required.every(name => jobs.some(job => job.name === name && job.conclusion === 'success'));
             core.setOutput('release', String(ran));
 
-      - name: Mint scaffold GitHub App token
+      - name: Check the deploy dispatch configuration
+        if: steps.product-checks.outputs.release == 'true'
+        env:
+          RELEASE_REPOSITORY: ${{ secrets.RELEASE_REPOSITORY }}
+          SEANCE_DEPLOY_WORKFLOW: ${{ secrets.SEANCE_DEPLOY_WORKFLOW }}
+        run: |
+          missing=""
+          [ -n "$RELEASE_REPOSITORY" ] || missing="$missing RELEASE_REPOSITORY"
+          [ -n "$SEANCE_DEPLOY_WORKFLOW" ] || missing="$missing SEANCE_DEPLOY_WORKFLOW"
+          if [ -n "$missing" ]; then
+            echo "::error::The deploy dispatch is not configured. Empty or unset secret(s):$missing"
+            exit 1
+          fi
+
+      - name: Mint deploy GitHub App token
         if: steps.product-checks.outputs.release == 'true'
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -64,17 +78,19 @@ jobs:
           client-id: Iv23liy6T6BW0BXuZRzx
           private-key: ${{ secrets.EHSRE_APP_PRIVATE_KEY }}
           owner: noisefactorllc
-          repositories: scaffold
+          repositories: ${{ secrets.RELEASE_REPOSITORY }}
 
       - name: Dispatch the CI-verified commit
         if: steps.product-checks.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          RELEASE_REPOSITORY: ${{ secrets.RELEASE_REPOSITORY }}
+          SEANCE_DEPLOY_WORKFLOW: ${{ secrets.SEANCE_DEPLOY_WORKFLOW }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          gh workflow run deploy-seance.yml \
-            --repo noisefactorllc/scaffold --ref main \
+          gh workflow run "$SEANCE_DEPLOY_WORKFLOW" \
+            --repo "$GITHUB_REPOSITORY_OWNER/$RELEASE_REPOSITORY" --ref main \
             -f seance_sha="$SOURCE_SHA"
-          echo "Dispatched scaffold deploy-seance for $SOURCE_SHA"
+          echo "Dispatched the deploy for $SOURCE_SHA"
