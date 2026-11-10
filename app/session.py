@@ -818,8 +818,11 @@ class Session:
     # -- polydoc ----------------------------------------------------------- #
 
     def _author_key(self, identity: Identity, connection_id: str) -> str:
+        # Each connection numbers its own proposals: a member's tabs are
+        # independent authors, or one tab's proposal reads as another's
+        # retransmit and is dropped.
         if identity.kind == Kind.MEMBER:
-            return f"member:{identity.user_id}"
+            return f"member:{identity.user_id}:{connection_id}"
         return f"connection:{connection_id}"
 
     def _do_poly_snapshot(self, conn: ConnLike, msg: dict) -> None:

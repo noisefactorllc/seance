@@ -428,3 +428,50 @@ test('live-11 a child update that names no parent keeps the authoritative parent
     const server = await serverDocs(sessionId, owner.layer.anonToken)
     assert.deepEqual(Object.fromEntries(server.poly.nodes.map((entry) => [entry.id, entry.parentId ?? null])), { P: null, Q: null, 'P.C': 'Q' })
 })
+
+// A member connection: the hello carries a single-use ticket minted for that member.
+async function memberSocket(userId) {
+    const response = await originFetch(`${URL_}/v1/ticket`, {
+        method: 'POST', headers: { 'X-GS-User-Id': userId, 'X-GS-Username': userId },
+    })
+    assert.equal(response.status, 200, 'set SEANCE_GS_TRUSTED_NETS to the loopback peer to mint member tickets')
+    const { ticket } = await response.json()
+    return class MemberSocket extends OriginWebSocket {
+        send(data) {
+            const frame = JSON.parse(data)
+            if (frame.type !== 'hello') return super.send(data)
+            delete frame.anon_token
+            return super.send(JSON.stringify({ ...frame, ticket }))
+        }
+    }
+}
+
+test('live-12 two tabs of one member each get their own result for distinct node updates', { skip }, async (t) => {
+    const owner = mk()
+    t.after(() => owner.layer.goOffline())
+    await owner.layer.takeOnline({ poly: { nodes: [
+        { id: 'A', kind: 'layer', text: 'a' },
+        { id: 'B', kind: 'layer', text: 'b' },
+    ] } })
+    const sessionId = owner.layer.getSessionId()
+    const userId = `member-tabs-${Date.now()}`
+    const first = mk({ Socket: await memberSocket(userId), inFlightTimeoutMs: 60000 })
+    const second = mk({ Socket: await memberSocket(userId), inFlightTimeoutMs: 60000 })
+    t.after(() => { first.layer.goOffline(); second.layer.goOffline() })
+    await first.layer.joinSession(sessionId)
+    await second.layer.joinSession(sessionId)
+    const acks = { first: [], second: [] }
+    first.layer.on('node-ack', (p) => acks.first.push(p))
+    second.layer.on('node-ack', (p) => acks.second.push(p))
+
+    first.layer.upsertNode('A', { kind: 'layer', text: 'new-a' })
+    await waitFor(() => acks.first.length === 1 && second.layer.getNodes().find((node) => node.id === 'A')?.text === 'new-a')
+    second.layer.upsertNode('B', { kind: 'layer', text: 'new-b' })
+    await waitFor(() => acks.second.length === 1)
+    assert.deepEqual(second.layer.getPendingNodeWrites(), [])
+    assert.equal(first.sockets.length + second.sockets.length, 2, 'no tab reconnected to recover a dropped proposal')
+    const proposals = [first, second].map(({ sockets }) => sockets[0].sentFrames.find((frame) => frame.type === 'poly-token-upsert'))
+    assert.deepEqual(proposals.map((frame) => [frame.base_rev, frame.author_seq]), [[1, 1], [1, 1]], 'both tabs proposed from the same base and sequence')
+    const server = await serverDocs(sessionId, owner.layer.anonToken)
+    assert.deepEqual(Object.fromEntries(server.poly.nodes.map((node) => [node.id, node.text])), { A: 'new-a', B: 'new-b' })
+})

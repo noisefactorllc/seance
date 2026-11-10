@@ -43,6 +43,8 @@ def main() -> int:
             "SEANCE_LIMIT_CREATES_PER_IP_HOUR": "1000",
             "SEANCE_LIMIT_CREATES_PER_IDENTITY_HOUR": "1000",
             "SEANCE_LIMIT_JOINS_PER_IP_MIN": "1000",
+            # The live tests mint member tickets from this loopback peer.
+            "SEANCE_GS_TRUSTED_NETS": "127.0.0.1/32",
             "SEANCE_LIVE_URL": base_url,
             "SEANCE_PERF": "1",
         })

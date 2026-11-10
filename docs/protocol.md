@@ -307,7 +307,9 @@ each shares a name with a §3 client→server message and stays **valid inbound*
 exactly as defined there — the server routes on direction, not a distinct type
 name.
 
-A retransmitted poly proposal (same `author_seq` from the same author) is
+A retransmitted poly proposal (same `base_rev` and `author_seq` on the same
+connection; each connection, including each tab of one member, numbers its own
+proposals) is
 **deduplicated silently** — no `poly-ack` and no `poly-reject`
 (`engine.py`; `session.py` `_poly_result`). Rely on your own retry/ack
 bookkeeping, not on a guaranteed response per proposal.

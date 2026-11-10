@@ -685,6 +685,47 @@ def test_poly_upsert_ack_decorate_duplicate_reject(clock):
     assert frames(b, "poly-token-upsert") == []
 
 
+def test_poly_member_tabs_number_proposals_independently(clock):
+    s = Session("s", "owner", Limits(), clock)
+    o = FakeConn(member("owner"))
+    s.join(o)
+    for node_id in ("A", "B"):
+        s.handle(
+            o.connection_id,
+            {"type": "poly-token-upsert", "base_rev": s.poly.rev, "id": node_id,
+             "kind": "layer", "text": node_id.lower()},
+        )
+    base = s.poly.rev
+    tab1 = FakeConn(member("m"))
+    tab2 = FakeConn(member("m"))
+    s.join(tab1)
+    s.join(tab2)
+    tab1.sent.clear()
+    tab2.sent.clear()
+
+    # Two tabs of one member each send their first proposal from the same base.
+    first = {"type": "poly-token-upsert", "base_rev": base, "id": "A", "kind": "layer",
+             "text": "new-a", "author_seq": 1}
+    s.handle(tab1.connection_id, first)
+    s.handle(
+        tab2.connection_id,
+        {"type": "poly-token-upsert", "base_rev": base, "id": "B", "kind": "layer",
+         "text": "new-b", "author_seq": 1},
+    )
+    assert frames(tab1, "poly-ack")[0]["author_seq"] == 1
+    assert frames(tab2, "poly-ack")[0]["author_seq"] == 1
+    assert {n.id: n.text for n in s.poly.nodes.values()} == {"A": "new-a", "B": "new-b"}
+
+    # A genuine retransmit from the first tab is still silent and applies once.
+    rev = s.poly.rev
+    tab1.sent.clear()
+    tab2.sent.clear()
+    s.handle(tab1.connection_id, first)
+    assert tab1.sent == []
+    assert frames(tab2, "poly-token-upsert") == []
+    assert s.poly.rev == rev
+
+
 def test_poly_delete_ack_and_decorated_without_version(clock):
     s = Session("s", "owner", Limits(), clock)
     o = FakeConn(member("owner"))
