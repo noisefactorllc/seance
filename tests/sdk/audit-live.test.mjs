@@ -393,3 +393,38 @@ test('live-10 ambiguous reconnect holds the draft after an accepted edit was rep
     assert.equal(author.events.find(({ name, p }) => name === 'doc-reject' && p.reason === 'reconnect_ambiguous')?.p.snapshot.text, 'azbc')
     assert.equal(author.sockets[1].sentFrames.some((frame) => frame.type === 'doc-edit'), false)
 })
+
+test('live-11 a child update that names no parent keeps the authoritative parent everywhere', { skip }, async (t) => {
+    const owner = mk()
+    const peer = mk()
+    const late = mk()
+    t.after(() => { owner.layer.goOffline(); peer.layer.goOffline(); late.layer.goOffline() })
+    await owner.layer.takeOnline({ poly: { nodes: [
+        { id: 'P', kind: 'layer', text: 'parent' },
+        { id: 'Q', kind: 'layer', text: 'other parent' },
+        { id: 'P.C', kind: 'layer', text: 'child', parentId: 'P' },
+    ] } })
+    const sessionId = owner.layer.getSessionId()
+    await peer.layer.joinSession(sessionId)
+    const node = (layer, id) => layer.getNodes().find((entry) => entry.id === id)
+    const parents = (id) => [owner.layer, peer.layer].map((layer) => node(layer, id)?.parentId)
+    const settled = (id, text) => () => owner.layer.getPendingNodeWrites().length === 0 &&
+        node(owner.layer, id)?.text === text && node(peer.layer, id)?.text === text
+    assert.deepEqual(parents('P.C'), ['P', 'P'])
+
+    owner.layer.upsertNode('P.C', { kind: 'layer', text: 'changed' })
+    await waitFor(settled('P.C', 'changed'))
+    assert.deepEqual(parents('P.C'), ['P', 'P'], 'the proposer and the peer keep the parent the server kept')
+    await late.layer.joinSession(sessionId)
+    assert.equal(node(late.layer, 'P.C').parentId, 'P')
+
+    owner.layer.upsertNode('P.C', { kind: 'layer', text: 'moved', parentId: 'Q' })
+    await waitFor(settled('P.C', 'moved'))
+    assert.deepEqual(parents('P.C'), ['Q', 'Q'], 'an explicit parent still moves the node')
+
+    owner.layer.upsertNode('P', { kind: 'layer', text: 'root changed' })
+    await waitFor(settled('P', 'root changed'))
+    assert.deepEqual(parents('P'), [null, null], 'a root node stays a root')
+    const server = await serverDocs(sessionId, owner.layer.anonToken)
+    assert.deepEqual(Object.fromEntries(server.poly.nodes.map((entry) => [entry.id, entry.parentId ?? null])), { P: null, Q: null, 'P.C': 'Q' })
+})

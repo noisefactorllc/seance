@@ -768,7 +768,8 @@ class OnlineDslLayer {
             id: msg.id,
             kind: msg.kind,
             text: msg.text,
-            parentId: msg.parentId ?? null,
+            // As on the server, an update that names no parent keeps the node's parent.
+            parentId: msg.parentId ?? this.nodes.get(msg.id)?.parentId ?? null,
             version: msg.version,
         }
         this.nodes.set(node.id, node)
@@ -805,7 +806,7 @@ class OnlineDslLayer {
                     id: pending.id,
                     kind: pending.kind,
                     text: pending.text,
-                    parentId: pending.parentId,
+                    parentId: pending.parentId ?? this.nodes.get(pending.id)?.parentId ?? null,
                     version: applied.version,
                 })
             }
